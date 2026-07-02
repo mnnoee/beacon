@@ -27,6 +27,8 @@ func main() {
 		cmdBeacon(os.Args[2:])
 	case "ssh":
 		cmdSSH(os.Args[2:])
+	case "monitor":
+		cmdMonitor(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -43,6 +45,7 @@ func printUsage() {
   beacon ca <команда>       — операции Главной Ноды (CA)
   beacon beacon             — запуск Маячка
   beacon ssh <цель>         — SSH-подключение к маячку
+  beacon monitor            — TUI-монитор состояния сети
 
 Команды CA:
   generate-ca              — генерация корневого CA
@@ -128,6 +131,29 @@ func cmdSSH(args []string) {
 
 	if err := client.Connect(target, execCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// cmdMonitor запускает TUI-монитор состояния сети.
+func cmdMonitor(args []string) {
+	fs := flag.NewFlagSet("monitor", flag.ExitOnError)
+	dataDir := fs.String("dir", "./beacon-data", "директория с данными")
+	nodeName := fs.String("name", "", "имя этого маячка (обязательно)")
+
+	fs.Parse(args)
+
+	if *nodeName == "" {
+		fmt.Fprintln(os.Stderr, "укажите имя: beacon monitor -name <имя>")
+		os.Exit(1)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = *dataDir
+	cfg.NodeName = *nodeName
+
+	if err := RunMonitor(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "ошибка монитора: %v\n", err)
 		os.Exit(1)
 	}
 }
