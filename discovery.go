@@ -101,32 +101,9 @@ func (d *Discovery) Start() error {
 
 	d.conn = conn
 
-	// Пробуем multicast — если не получится, fallback на broadcast
-	mcastOK := false
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
-				groupAddr := net.ParseIP(d.mcastAddr)
-				if groupAddr != nil {
-					if err := joinMulticastGroup(conn, &iface, groupAddr); err != nil {
-						log.Printf("[Discovery] multicast не удался на %s: %v, fallback на broadcast", iface.Name, err)
-					} else {
-						mcastOK = true
-						log.Printf("[Discovery] multicast подключён на %s (%s)", iface.Name, d.mcastAddr)
-					}
-				}
-				break
-			}
-		}
-	}
-
-	if !mcastOK {
-		d.useMulticast = false
-		log.Printf("[Discovery] multicast недоступен, используется broadcast: %s", d.broadcastIP)
-	} else {
-		d.useMulticast = true
-	}
+	// Всегда broadcast — multicast не работает через WiFi-роутеры
+	d.useMulticast = false
+	log.Printf("[Discovery] запущен на %s:%d (broadcast: %s)", d.bindAddr, d.port, d.broadcastIP)
 
 	d.wg.Add(1)
 	go d.receiveLoop()
@@ -137,11 +114,7 @@ func (d *Discovery) Start() error {
 	d.wg.Add(1)
 	go d.nonceCleanupLoop()
 
-	if d.useMulticast {
-		log.Printf("[Discovery] запущен на %s:%d (multicast: %s)", d.bindAddr, d.port, d.mcastAddr)
-	} else {
-		log.Printf("[Discovery] запущен на %s:%d (broadcast: %s)", d.bindAddr, d.port, d.broadcastIP)
-	}
+	return nil
 	return nil
 }
 
