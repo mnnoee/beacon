@@ -191,10 +191,13 @@ func (b *BeaconNode) Start() error {
 	b.discovery = NewDiscovery(
 		b.nodeID, b.edPriv,
 		b.config.DiscoveryPort,
-		b.config.BroadcastAddr,
+		"239.19.84.1",           // multicast (попытка №1)
+		b.config.BroadcastAddr,  // broadcast (основной режим)
 		b.config.BindAddr,
 		limiter,
 	)
+	// Начинаем с broadcast — multicast не работает через WiFi-роутеры
+	b.discovery.useMulticast = false
 
 	b.discovery.OnDiscover(b.onPeerDiscovered)
 

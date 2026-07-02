@@ -15,13 +15,11 @@ import (
 // SO_REUSEPORT — Linux-специфичная опция сокета (значение 15).
 const SO_REUSEPORT = 15
 
-// NonceTTL — время жизни nonce в секундах (300 сек = 5 минут).
+// NonceTTL — время жизни nonce (300 сек = 5 минут).
 const NonceTTL = 300 * time.Second
 
-// MulticastGroup — группа для discovery (RFC 5771, диапазон 239.x.x.x).
-const MulticastGroup = "239.19.84.1"
-
-// Discovery — модуль сетевого обнаружения маячков через UDP multicast.
+// Discovery — модуль сетевого обнаружения маячков.
+// Автоматически выбирает multicast или broadcast в зависимости от сети.
 type Discovery struct {
 	mu sync.Mutex
 
@@ -30,9 +28,9 @@ type Discovery struct {
 	pubKey    ed25519.PublicKey
 
 	port        int
-	mcastAddr   string // multicast-адрес для отправки
+	mcastAddr   string // multicast-адрес (попытка №1)
+	broadcastIP string // broadcast-адрес (fallback)
 	bindAddr    string
-	iface       *net.Interface // сетевой интерфейс для multicast
 
 	conn     *net.UDPConn
 	limiter  *RateLimiter
@@ -40,7 +38,9 @@ type Discovery struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 
-	// Кэш виденных nonce (replay protection + игнор своих broadcast)
+	// Режим работы: true = multicast, false = broadcast
+	useMulticast bool
+
 	sentNonces map[[32]byte]time.Time
 }
 
@@ -48,17 +48,19 @@ type Discovery struct {
 type DiscoveryCallback func(senderID [16]byte, addr *net.UDPAddr, pktType uint8)
 
 // NewDiscovery создаёт новый экземпляр модуля обнаружения.
-func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, mcastAddr, bindAddr string, limiter *RateLimiter) *Discovery {
+func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, mcastAddr, broadcastIP, bindAddr string, limiter *RateLimiter) *Discovery {
 	return &Discovery{
-		nodeID:     nodeID,
-		privKey:    privKey,
-		pubKey:     privKey.Public().(ed25519.PublicKey),
-		port:       port,
-		mcastAddr:  mcastAddr,
-		bindAddr:   bindAddr,
-		limiter:    limiter,
-		stopCh:     make(chan struct{}),
-		sentNonces: make(map[[32]byte]time.Time),
+		nodeID:       nodeID,
+		privKey:      privKey,
+		pubKey:       privKey.Public().(ed25519.PublicKey),
+		port:         port,
+		mcastAddr:    mcastAddr,
+		broadcastIP:  broadcastIP,
+		bindAddr:     bindAddr,
+		limiter:      limiter,
+		stopCh:       make(chan struct{}),
+		sentNonces:   make(map[[32]byte]time.Time),
+		useMulticast: true, // начнём с multicast, fallback на broadcast
 	}
 }
 
@@ -70,8 +72,8 @@ func (d *Discovery) OnDiscover(cb DiscoveryCallback) {
 }
 
 // Start запускает discovery-модуль.
+// Пробует multicast, при неудаче — fallback на broadcast.
 func (d *Discovery) Start() error {
-	// Привязываемся к multicast-адресу для приёма
 	listenAddr := &net.UDPAddr{
 		IP:   net.ParseIP(d.bindAddr),
 		Port: d.port,
@@ -93,27 +95,38 @@ func (d *Discovery) Start() error {
 
 	conn := listener.(*net.UDPConn)
 
-	// Определяем интерфейс для multicast
+	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
+		log.Printf("[Discovery] предупреждение: не удалось увеличить read buffer: %v", err)
+	}
+
+	d.conn = conn
+
+	// Пробуем multicast — если не получится, fallback на broadcast
+	mcastOK := false
 	ifaces, err := net.Interfaces()
 	if err == nil {
 		for _, iface := range ifaces {
 			if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
-				d.iface = &iface
-				// Присоединяемся к multicast-группе на этом интерфейсе
 				groupAddr := net.ParseIP(d.mcastAddr)
-				if err := joinMulticastGroup(conn, &iface, groupAddr); err != nil {
-					log.Printf("[Discovery] не удалось присоединиться к multicast на %s: %v", iface.Name, err)
+				if groupAddr != nil {
+					if err := joinMulticastGroup(conn, &iface, groupAddr); err != nil {
+						log.Printf("[Discovery] multicast не удался на %s: %v, fallback на broadcast", iface.Name, err)
+					} else {
+						mcastOK = true
+						log.Printf("[Discovery] multicast подключён на %s (%s)", iface.Name, d.mcastAddr)
+					}
 				}
 				break
 			}
 		}
 	}
 
-	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
-		log.Printf("[Discovery] предупреждение: не удалось увеличить read buffer: %v", err)
+	if !mcastOK {
+		d.useMulticast = false
+		log.Printf("[Discovery] multicast недоступен, используется broadcast: %s", d.broadcastIP)
+	} else {
+		d.useMulticast = true
 	}
-
-	d.conn = conn
 
 	d.wg.Add(1)
 	go d.receiveLoop()
@@ -124,7 +137,11 @@ func (d *Discovery) Start() error {
 	d.wg.Add(1)
 	go d.nonceCleanupLoop()
 
-	log.Printf("[Discovery] запущен на %s:%d (multicast: %s)", d.bindAddr, d.port, d.mcastAddr)
+	if d.useMulticast {
+		log.Printf("[Discovery] запущен на %s:%d (multicast: %s)", d.bindAddr, d.port, d.mcastAddr)
+	} else {
+		log.Printf("[Discovery] запущен на %s:%d (broadcast: %s)", d.bindAddr, d.port, d.broadcastIP)
+	}
 	return nil
 }
 
@@ -179,7 +196,8 @@ func (d *Discovery) broadcastLoop() {
 	}
 }
 
-// sendAnnounce создаёт и отправляет PktAnnounce через multicast.
+// sendAnnounce создаёт и отправляет PktAnnounce.
+// Использует multicast или broadcast в зависимости от режима.
 func (d *Discovery) sendAnnounce() error {
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
@@ -197,14 +215,29 @@ func (d *Discovery) sendAnnounce() error {
 	pktSig := ed25519.Sign(d.privKey, dataToSign)
 	fullPacket := append(dataToSign, pktSig...)
 
+	// Выбираем адрес: multicast или broadcast
+	targetIP := d.mcastAddr
+	if !d.useMulticast {
+		targetIP = d.broadcastIP
+	}
+
 	destAddr := &net.UDPAddr{
-		IP:   net.ParseIP(d.mcastAddr),
+		IP:   net.ParseIP(targetIP),
 		Port: d.port,
 	}
 
 	_, err := d.conn.WriteToUDP(fullPacket, destAddr)
 	if err != nil {
-		return fmt.Errorf("отправка multicast: %w", err)
+		// Fallback: если multicast не удался, пробуем broadcast
+		if d.useMulticast {
+			log.Printf("[Discovery] multicast отправка не удалась: %v, fallback на broadcast", err)
+			d.useMulticast = false
+			destAddr.IP = net.ParseIP(d.broadcastIP)
+			_, err = d.conn.WriteToUDP(fullPacket, destAddr)
+		}
+		if err != nil {
+			return fmt.Errorf("отправка: %w", err)
+		}
 	}
 
 	d.mu.Lock()
