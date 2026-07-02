@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/ed25519"
 	"fmt"
 	"log"
 	"net"
@@ -29,76 +28,69 @@ func (s PeerStatus) String() string {
 	case StatusOffline:
 		return "OFFLINE"
 	default:
-		return "UNKNOWN"
+		return "???"
 	}
 }
 
 type PeerInfo struct {
-	Name      string
-	IP        string
-	TLSPort   int
-	Status    PeerStatus
-	Latency   time.Duration
-	LastSeen  time.Time
-	FirstSeen time.Time
+	Name    string
+	IP      string
+	Port    int
+	Status  PeerStatus
+	Ping    time.Duration
+	LastTry time.Time
 }
 
 type Monitor struct {
-	mu    sync.Mutex
-	peers []*PeerInfo
-
-	cfg        *Config
-	stopCh     chan struct{}
-	stopOnce   sync.Once
-	nodeName   string
-	uptime     time.Time
-	trustStore *TrustStore
+	mu       sync.Mutex
+	peers    []*PeerInfo
+	cfg      *Config
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	name     string
+	uptime   time.Time
 }
 
 func NewMonitor(cfg *Config, ts *TrustStore) *Monitor {
 	m := &Monitor{
-		peers:      make([]*PeerInfo, 0),
-		cfg:        cfg,
-		stopCh:     make(chan struct{}),
-		nodeName:   cfg.NodeName,
-		uptime:     time.Now(),
-		trustStore: ts,
+		cfg:    cfg,
+		peers:  make([]*PeerInfo, 0),
+		stopCh: make(chan struct{}),
+		name:   cfg.NodeName,
+		uptime: time.Now(),
 	}
-	m.loadKnownPeers()
+	m.loadFromTrustStore(ts)
+	m.loadPeersFile()
 	return m
 }
 
-// loadKnownPeers загружает пиров из TrustStore + peers-файла.
-func (m *Monitor) loadKnownPeers() {
-	// 1. Из TrustStore (только имена, без IP)
-	if m.trustStore != nil {
-		for _, cert := range m.trustStore.getTrustedCerts() {
-			cn := cert.Subject.CommonName
-			if cn == "Root CA" || cn == "" || cn == m.nodeName {
-				continue
-			}
-			m.peers = append(m.peers, &PeerInfo{
-				Name:      cn,
-				TLSPort:   m.cfg.TLSPort,
-				Status:    StatusUnknown,
-				FirstSeen: time.Now(),
-			})
-		}
+func (m *Monitor) loadFromTrustStore(ts *TrustStore) {
+	if ts == nil {
+		return
 	}
-
-	// 2. Из файла peers.txt (имя IP)
-	m.loadPeersFile()
+	for _, cert := range ts.getTrustedCerts() {
+		cn := cert.Subject.CommonName
+		if cn == "Root CA" || cn == "" || cn == m.name {
+			continue
+		}
+		m.peers = append(m.peers, &PeerInfo{
+			Name: cn,
+			Port: m.cfg.TLSPort,
+		})
+	}
 }
 
-// loadPeersFile загружает пиры из файла peers.txt
-// Формат: <имя> <ip> (по одной строке)
 func (m *Monitor) loadPeersFile() {
-	peersFile := m.cfg.DataDir + "/peers.txt"
-	f, err := os.Open(peersFile)
+	f, err := os.Open(m.cfg.DataDir + "/peers.txt")
 	if err != nil {
 		return
 	}
 	defer f.Close()
+
+	known := make(map[string]bool)
+	for _, p := range m.peers {
+		known[p.Name] = true
+	}
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -110,26 +102,20 @@ func (m *Monitor) loadPeersFile() {
 		if len(parts) < 2 {
 			continue
 		}
-		name := parts[0]
-		ip := parts[1]
+		name, ip := parts[0], parts[1]
 
-		// Обновляем существующий пир или добавляем нового
-		found := false
-		for _, p := range m.peers {
-			if p.Name == name {
-				p.IP = ip
-				p.TLSPort = m.cfg.TLSPort
-				found = true
-				break
+		if known[name] {
+			for _, p := range m.peers {
+				if p.Name == name {
+					p.IP = ip
+					p.Port = m.cfg.TLSPort
+				}
 			}
-		}
-		if !found {
+		} else {
 			m.peers = append(m.peers, &PeerInfo{
-				Name:      name,
-				IP:        ip,
-				TLSPort:   m.cfg.TLSPort,
-				Status:    StatusUnknown,
-				FirstSeen: time.Now(),
+				Name: name,
+				IP:   ip,
+				Port: m.cfg.TLSPort,
 			})
 		}
 	}
@@ -140,19 +126,18 @@ func (m *Monitor) Stop() {
 }
 
 func (m *Monitor) Run() error {
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	old, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return fmt.Errorf("raw mode: %w", err)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer term.Restore(int(os.Stdin.Fd()), old)
 
 	go m.pingLoop()
 	go m.inputLoop()
 
+	m.render()
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
-	m.render()
 
 	for {
 		select {
@@ -169,12 +154,8 @@ func (m *Monitor) render() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Очищаем экран
-	fmt.Print("\033[2J\033[H")
+	fmt.Print("\033[H\033[2J")
 
-	w := 62 // ширина внутренней области
-
-	uptime := time.Since(m.uptime).Truncate(time.Second)
 	online := 0
 	for _, p := range m.peers {
 		if p.Status == StatusOnline {
@@ -182,56 +163,38 @@ func (m *Monitor) render() {
 		}
 	}
 
-	// Верхняя рамка
-	fmt.Printf("\033[1;36m┌%s┐\033[0m\n", repeat("─", w))
-	fmt.Printf("\033[1;36m│\033[0m \033[1;37mNetwork Beacons Monitor\033[0m%s\033[1;36m│\033[0m\n", repeat(" ", w-25))
-	fmt.Printf("\033[1;36m├%s┤\033[0m\n", repeat("─", w))
-	fmt.Printf("\033[1;36m│\033[0m Узел: \033[1;33m%-14s\033[0m  Аптайм: \033[1;32m%-8s\033[0m  %s\033[1;36m│\033[0m\n",
-		m.nodeName, uptime, pad("", w-38))
-	fmt.Printf("\033[1;36m│\033[0m Пиров: \033[1;33m%d\033[0m (онлайн: \033[1;32m%d\033[0m)%s\033[1;36m│\033[0m\n",
-		len(m.peers), online, pad("", w-22-len(fmt.Sprintf("%d%d", len(m.peers), online))))
-	fmt.Printf("\033[1;36m├%s┤\033[0m\n", repeat("─", w))
-
-	// Заголовок таблицы
-	fmt.Printf("\033[1;36m│\033[0m \033[1m%-16s %-15s %-10s %-6s %-10s\033[0m %s\033[1;36m│\033[0m\n",
-		"ИМЯ", "IP", "СТАТУС", "ПИНГ", "ПОСЛЕДНИЙ", pad("", w-55))
-	fmt.Printf("\033[1;36m│\033[0m %s %s\033[1;36m│\033[0m\n", repeat("─", 54), pad("", w-55))
+	fmt.Println("╔══════════════════════════════════════════════════════════╗")
+	fmt.Printf("║  Network Beacons Monitor                               ║\n")
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Printf("║  Узел: %-10s  Пиров: %d (онлайн: %d)              ║\n", m.name, len(m.peers), online)
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Println("║  Имя              IP               Статус    Пинг      ║")
+	fmt.Println("║  ──────────────── ──────────────── ──────── ──────────  ║")
 
 	if len(m.peers) == 0 {
-		fmt.Printf("\033[1;36m│\033[0m \033[2m%s\033[0m %s\033[1;36m│\033[0m\n", pad("нет известных пиров", 54), pad("", w-55))
+		fmt.Println("║  (нет пиров)                                           ║")
 	}
 
-	for _, peer := range m.peers {
-		color := "\033[33m"
-		if peer.Status == StatusOnline {
-			color = "\033[32m"
-		} else if peer.Status == StatusOffline {
-			color = "\033[31m"
+	for _, p := range m.peers {
+		name := p.Name
+		if len(name) > 16 {
+			name = name[:13] + "..."
 		}
-
-		latency := "—"
-		if peer.Latency > 0 {
-			latency = fmt.Sprintf("%dms", peer.Latency.Milliseconds())
-		}
-
-		lastSeen := "—"
-		if !peer.LastSeen.IsZero() {
-			lastSeen = fmt.Sprintf("%dsназад", int(time.Since(peer.LastSeen).Seconds()))
-		}
-
-		name := truncate(peer.Name, 16)
-		ip := truncate(peer.IP, 15)
+		ip := p.IP
 		if ip == "" {
 			ip = "—"
 		}
-
-		fmt.Printf("\033[1;36m│\033[0m %-16s %-15s %s%-10s\033[0m %-6s %-10s %s\033[1;36m│\033[0m\n",
-			name, ip, color, peer.Status, latency, lastSeen, pad("", w-55))
+		status := p.Status.String()
+		ping := "—"
+		if p.Ping > 0 {
+			ping = fmt.Sprintf("%dms", p.Ping.Milliseconds())
+		}
+		fmt.Printf("║  %-16s %-15s %-8s %-8s ║\n", name, ip, status, ping)
 	}
 
-	fmt.Printf("\033[1;36m├%s┤\033[0m\n", repeat("─", w))
-	fmt.Printf("\033[1;36m│\033[0m \033[2m[Q] Выход   [R] Ping всех пиров\033[0m%s\033[1;36m│\033[0m\n", pad("", w-34))
-	fmt.Printf("\033[1;36m└%s┘\033[0m\n", repeat("─", w))
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Println("║  [Q] Выход  [R] Ping всех                              ║")
+	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 }
 
 func (m *Monitor) inputLoop() {
@@ -247,7 +210,7 @@ func (m *Monitor) inputLoop() {
 			m.Stop()
 			return
 		}
-		if buf[0] == 'r' || buf[0] == 'R' || buf[0] == 'p' || buf[0] == 'P' {
+		if buf[0] == 'r' || buf[0] == 'R' {
 			m.pingAll()
 			m.render()
 		}
@@ -270,12 +233,12 @@ func (m *Monitor) pingLoop() {
 
 func (m *Monitor) pingAll() {
 	m.mu.Lock()
-	peers := make([]*PeerInfo, len(m.peers))
-	copy(peers, m.peers)
+	list := make([]*PeerInfo, len(m.peers))
+	copy(list, m.peers)
 	m.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for _, p := range peers {
+	for _, p := range list {
 		if p.IP == "" {
 			continue
 		}
@@ -283,75 +246,38 @@ func (m *Monitor) pingAll() {
 		go func(peer *PeerInfo) {
 			defer wg.Done()
 			start := time.Now()
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.TLSPort), 3*time.Second)
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.Port), 3*time.Second)
 			latency := time.Since(start)
 
 			m.mu.Lock()
 			defer m.mu.Unlock()
+			peer.LastTry = time.Now()
 			if err != nil {
 				peer.Status = StatusOffline
-				peer.Latency = 0
+				peer.Ping = 0
 			} else {
 				conn.Close()
 				peer.Status = StatusOnline
-				peer.Latency = latency
-				peer.LastSeen = time.Now()
+				peer.Ping = latency
 			}
 		}(p)
 	}
 	wg.Wait()
 }
 
-func repeat(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i := 0; i < n; i++ {
-		b.WriteString(s)
-	}
-	return b.String()
-}
-
-func pad(s string, width int) string {
-	if len(s) >= width {
-		return s[:width]
-	}
-	return s + repeat(" ", width-len(s))
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
-}
-
 func RunMonitor(cfg *Config) error {
-	keyPath, _, _ := cfg.BeaconPaths()
-	nodeName := cfg.NodeName
-
 	var ts *TrustStore
 	_, _, caPath := cfg.BeaconPaths()
 	crlPath := cfg.DataDir + "/ca/crl.pem"
-	if _, statErr := os.Stat(caPath); statErr == nil {
+	if _, e := os.Stat(caPath); e == nil {
 		ts, _ = NewTrustStore(caPath, crlPath)
 	}
 
 	monitor := NewMonitor(cfg, ts)
-
-	// Определяем nodeID
-	edKey, err := loadEd25519Key(keyPath)
-	if err == nil {
-		pub := edKey.Public().(ed25519.PublicKey)
-		_ = [16]byte(pub[:16])
-	}
-	_ = nodeName
+	defer monitor.Stop()
 
 	log.SetOutput(os.Stderr)
-	log.Printf("[Monitor] запуск: %s (пиров: %d)", cfg.NodeName, len(monitor.peers))
-	log.Printf("[Monitor] для добавления пиров создайте %s/peers.txt", cfg.DataDir)
-	log.Printf("[Monitor] формат: <имя> <ip>")
+	log.Printf("[Monitor] %s: %d пиров", cfg.NodeName, len(monitor.peers))
 
 	return monitor.Run()
 }
