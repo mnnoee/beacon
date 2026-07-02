@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -53,6 +54,8 @@ func printUsage() {
   revoke-beacon <serial>   — отзыв сертификата маячка
   list-trusted             — список доверенных узлов
   import-ca <путь>         — импорт CA-сертификата из файла
+  export-ca                — экспорт CA-файлов для копирования
+  sync-crl <host:path>     — синхронизация CRL с другой CA
 
 SSH:
   beacon ssh <ip:port>     — подключение по IP
@@ -212,6 +215,16 @@ func cmdCA(args []string) {
 		}
 		cmdImportCA(*dataDir, fs.Arg(0))
 
+	case "export-ca":
+		cmdExportCA(*dataDir)
+
+	case "sync-crl":
+		if fs.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "укажите источник CRL: beacon ca sync-crl <host:path>")
+			os.Exit(1)
+		}
+		cmdSyncCRL(*dataDir, fs.Arg(0))
+
 	default:
 		fmt.Fprintf(os.Stderr, "неизвестная подкоманда CA: %s\n", subCmd)
 		os.Exit(1)
@@ -355,6 +368,43 @@ func cmdImportCA(dataDir, caCertPath string) {
 		os.Exit(1)
 	}
 	fmt.Printf("CA-сертификат импортирован в %s/ca/ca-cert.pem\n", dataDir)
+}
+
+// cmdExportCA экспортирует CA-файлы для копирования на другую машину.
+func cmdExportCA(dataDir string) {
+	fmt.Println("=== CA Export ===")
+	fmt.Printf("Директория: %s/ca/\n", dataDir)
+	fmt.Println()
+	fmt.Println("Файлы для копирования на другую CA-машину:")
+	fmt.Println("  1. ca-key.pem     — приватный ключ CA (СЕКРЕТНО!)")
+	fmt.Println("  2. ca-cert.pem    — сертификат CA (публичный)")
+	fmt.Println("  3. crl.pem        — список отозванных сертификатов")
+	fmt.Println()
+	fmt.Println("Пример копирования:")
+	fmt.Printf("  scp %s/ca/*.pem user@remote-host:~/beacon-data/ca/\n", dataDir)
+	fmt.Println()
+	fmt.Println("После копирования на удалённой машине запустите:")
+	fmt.Println("  beacon ca list-trusted — проверьте что CA загружен")
+}
+
+// cmdSyncCRL синхронизирует CRL с другой CA-машиной через scp.
+func cmdSyncCRL(dataDir, source string) {
+	// source формат: user@host:/path/to/crl.pem
+	fmt.Printf("Синхронизация CRL с %s...\n", source)
+
+	crlPath := dataDir + "/ca/crl.pem"
+
+	// Пытаемся скопировать CRL через scp
+	cmd := fmt.Sprintf("scp %s %s", source, crlPath)
+	fmt.Printf("Выполняю: %s\n", cmd)
+
+	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ошибка scp: %v\n%s", err, string(out))
+		os.Exit(1)
+	}
+
+	fmt.Println("CRL успешно синхронизирован")
 }
 
 // cmdBeacon запускает Маячок.
