@@ -114,6 +114,18 @@ func cmdSSH(args []string) {
 	}
 
 	client := NewSSHClient(cfg)
+
+	// Загружаем TrustStore для проверки хост-ключей
+	_, _, caPath := cfg.BeaconPaths()
+	crlPath := cfg.DataDir + "/ca/crl.pem"
+	if _, err := os.Stat(caPath); err == nil {
+		ts, err := NewTrustStore(caPath, crlPath)
+		if err == nil {
+			ts.RegisterEd25519KeyFromDisk(cfg.DataDir)
+			client.SetTrustStore(ts)
+		}
+	}
+
 	if err := client.Connect(target, execCmd); err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка: %v\n", err)
 		os.Exit(1)

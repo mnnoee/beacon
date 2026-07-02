@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
@@ -16,14 +19,9 @@ import (
 )
 
 // SSHClient — SSH-клиент для подключения к другим маячкам.
-//
-// Поддерживает:
-// - Интерактивный shell (PTY)
-// - Выполнение команд (exec)
-// - Обнаружение маячков через UDP discovery
-// - Авторизацию по сертификату
 type SSHClient struct {
-	config *Config
+	config     *Config
+	trustStore *TrustStore
 }
 
 // NewSSHClient создаёт новый SSH-клиент.
@@ -31,36 +29,39 @@ func NewSSHClient(cfg *Config) *SSHClient {
 	return &SSHClient{config: cfg}
 }
 
+// SetTrustStore устанавливает TrustStore для проверки хост-ключей.
+func (c *SSHClient) SetTrustStore(ts *TrustStore) {
+	c.trustStore = ts
+}
+
 // Connect устанавливает SSH-соединение с маячком.
-//
-// Параметры:
-// - target: IP:port или имя маячка (для discovery)
-// - execCmd: команда для выполнения (пустая строка = interactive shell)
 func (c *SSHClient) Connect(target, execCmd string) error {
-	// Определяем адрес подключения
 	addr, err := c.resolveTarget(target)
 	if err != nil {
 		return fmt.Errorf("разрешение цели %s: %w", target, err)
 	}
 
-	// Создаём SSH signer из локальных ключей
 	keyPath, certPath, _ := c.config.BeaconPaths()
 	signer, err := createSSHCertSigner(keyPath, certPath)
 	if err != nil {
 		return fmt.Errorf("создание SSH signer: %w", err)
 	}
 
-	// Настраиваем SSH-клиент
+	// Проверка хост-ключа через TrustStore вместо InsecureIgnoreHostKey
+	hostKeyCallback := ssh.InsecureIgnoreHostKey()
+	if c.trustStore != nil {
+		hostKeyCallback = c.trustStore.VerifyHostKey
+	}
+
 	sshConfig := &ssh.ClientConfig{
 		User: "beacon",
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // P2P-сеть, проверяем через TrustStore
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 
-	// Подключаемся
 	log.Printf("[SSH] подключение к %s...", addr)
 	conn, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
@@ -84,12 +85,10 @@ func (c *SSHClient) execCommand(conn *ssh.Client, cmd string) error {
 	}
 	defer session.Close()
 
-	// Направляем stdin/stdout/stderr
 	session.Stdin = os.Stdin
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr
 
-	// Запускаем exec
 	if err := session.Run(cmd); err != nil {
 		if exitErr, ok := err.(*ssh.ExitError); ok {
 			return fmt.Errorf("команда завершена с кодом %d", exitErr.ExitStatus())
@@ -108,19 +107,16 @@ func (c *SSHClient) interactiveShell(conn *ssh.Client) error {
 	}
 	defer session.Close()
 
-	// Проверяем, что stdin — терминал
 	if !terminal.IsTerminal(int(os.Stdin.Fd())) {
 		return fmt.Errorf("интерактивный shell требует терминал")
 	}
 
-	// Сохраняем текущий режим терминала
 	oldState, err := terminal.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return fmt.Errorf("переключение в raw mode: %w", err)
 	}
 	defer terminal.Restore(int(os.Stdin.Fd()), oldState)
 
-	// Запрашиваем PTY
 	width, height, _ := terminal.GetSize(int(os.Stdin.Fd()))
 	modes := ssh.TerminalModes{
 		ssh.ECHO:          1,
@@ -132,22 +128,18 @@ func (c *SSHClient) interactiveShell(conn *ssh.Client) error {
 		return fmt.Errorf("запрос PTY: %w", err)
 	}
 
-	// Направляем stdin/stdout/stderr
 	session.Stdin = os.Stdin
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr
 
-	// Запускаем shell
 	if err := session.Shell(); err != nil {
 		return fmt.Errorf("запуск shell: %w", err)
 	}
 
-	// Обработка resize
 	sigWinch := make(chan os.Signal, 1)
 	signal.Notify(sigWinch, syscall.SIGWINCH)
 	defer signal.Stop(sigWinch)
 
-	// Горутина для обработки resize
 	go func() {
 		for range sigWinch {
 			w, h, _ := terminal.GetSize(int(os.Stdin.Fd()))
@@ -155,7 +147,6 @@ func (c *SSHClient) interactiveShell(conn *ssh.Client) error {
 		}
 	}()
 
-	// Ждём завершения shell
 	err = session.Wait()
 	if err != nil {
 		if exitErr, ok := err.(*ssh.ExitError); ok {
@@ -169,17 +160,14 @@ func (c *SSHClient) interactiveShell(conn *ssh.Client) error {
 
 // resolveTarget определяет IP:port по имени или адресу.
 func (c *SSHClient) resolveTarget(target string) (string, error) {
-	// Если уже IP:port — возвращаем как есть
 	if strings.Contains(target, ":") {
 		return target, nil
 	}
 
-	// Если это IP без порта — добавляем порт
 	if net.ParseIP(target) != nil {
 		return fmt.Sprintf("%s:%d", target, c.config.SSHPort), nil
 	}
 
-	// Иначе это имя маячка — ищем через discovery
 	ip, err := c.discoverBeacon(target)
 	if err != nil {
 		return "", err
@@ -189,16 +177,11 @@ func (c *SSHClient) resolveTarget(target string) (string, error) {
 }
 
 // discoverBeacon находит IP-адрес маячка по имени через UDP discovery.
-//
-// Отправляет Announce-пакет и ждёт Echo от целевого маячка.
-// В реальной сети это работает через broadcast — все маячки отвечают.
-// Здесь мы отправляем несколько broadcast-пакетов и собираем ответы.
 func (c *SSHClient) discoverBeacon(name string) (string, error) {
 	log.Printf("[SSH] поиск маячка '%s' через UDP discovery...", name)
 
 	nodeID := GenerateNodeID()
 
-	// Слушаем ответы на UDP (используем случайный порт, чтобы не конфликтовать с beacon)
 	listenAddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0}
 	conn, err := net.ListenUDP("udp4", listenAddr)
 	if err != nil {
@@ -208,7 +191,6 @@ func (c *SSHClient) discoverBeacon(name string) (string, error) {
 
 	discovered := make(chan string, 10)
 
-	// Горутина чтения ответов
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -226,13 +208,11 @@ func (c *SSHClient) discoverBeacon(name string) (string, error) {
 		}
 	}()
 
-	// Отправляем broadcast-пакеты
 	for i := 0; i < 5; i++ {
 		c.sendBroadcastDiscovery(nodeID)
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Собираем уникальные IP в течение 2 секунд
 	timeout := time.After(2 * time.Second)
 	var ips []string
 waitLoop:
@@ -262,7 +242,7 @@ waitLoop:
 	return ips[0], nil
 }
 
-// sendBroadcastDiscovery отправляет UDP broadcast-пакет.
+// sendBroadcastDiscovery отправляет UDP broadcast-пакет с Ed25519-подписью.
 func (c *SSHClient) sendBroadcastDiscovery(nodeID [16]byte) {
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
@@ -272,11 +252,20 @@ func (c *SSHClient) sendBroadcastDiscovery(nodeID [16]byte) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	// Генерируем nonce
 	rand.Read(pkt.Nonce[:])
 
-	// Подписываем (bare ключ — для discovery это ок)
-	data := pkt.Serialize()
+	dataToSign := pkt.Serialize()
+
+	// Подписываем пакет Ed25519-ключом
+	keyPath, _, _ := c.config.BeaconPaths()
+	edKey, err := loadEd25519Key(keyPath)
+	if err != nil {
+		log.Printf("[SSH] не удалось загрузить ключ для подписи: %v", err)
+		return
+	}
+
+	signature := ed25519.Sign(edKey, dataToSign)
+	fullPacket := append(dataToSign, signature...)
 
 	addr := &net.UDPAddr{
 		IP:   net.ParseIP(c.config.BroadcastAddr),
@@ -288,6 +277,26 @@ func (c *SSHClient) sendBroadcastDiscovery(nodeID [16]byte) {
 		return
 	}
 	defer conn.Close()
+	conn.Write(fullPacket)
+}
 
-	conn.Write(data)
+// loadEd25519Key загружает Ed25519 приватный ключ из PEM-файла.
+func loadEd25519Key(path string) (ed25519.PrivateKey, error) {
+	data, err := ReadFileContents(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("невалидный PEM")
+	}
+	parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	edKey, ok := parsedKey.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("ключ не Ed25519")
+	}
+	return edKey, nil
 }

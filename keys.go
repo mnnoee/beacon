@@ -19,7 +19,7 @@ import (
 // Реализация основана на RFC 8018 §5.2, использует только stdlib.
 //
 // 600 000 итераций (рекомендация OWASP 2023) дают адекватную защиту
-// от brute-force даже на GPU. Argon2id был бы лучше, но не входит в stdlib.
+// от brute-force даже на GPU.
 func DeriveKeyPBKDF2(password, salt []byte, iterations, keyLen int) []byte {
 	hLen := sha256.Size
 	dk := make([]byte, keyLen)
@@ -35,17 +35,22 @@ func DeriveKeyPBKDF2(password, salt []byte, iterations, keyLen int) []byte {
 
 		mac := hmac.New(sha256.New, password)
 		mac.Write(saltBlock)
-		u := mac.Sum(nil)
+		u1 := mac.Sum(nil)
 
+		// result = U1 (копируем для аккумуляции XOR)
+		result := make([]byte, hLen)
+		copy(result, u1[:hLen])
+
+		// Для каждой итерации: U_i = HMAC(password, U_{i-1}), result ^= U_i
+		prev := u1[:hLen]
 		for i := 1; i < iterations; i++ {
 			mac.Reset()
-			mac.Write(u)
+			mac.Write(prev)
 			uNext := mac.Sum(nil)
-			for j := range u {
-				u[j] ^= uNext[j]
+			for j := 0; j < hLen; j++ {
+				result[j] ^= uNext[j]
 			}
-			u = u[:hLen]
-			copy(u, uNext[:hLen])
+			copy(prev, uNext[:hLen])
 		}
 
 		start := (block - 1) * hLen
@@ -53,7 +58,7 @@ func DeriveKeyPBKDF2(password, salt []byte, iterations, keyLen int) []byte {
 		if end > keyLen {
 			end = keyLen
 		}
-		copy(dk[start:end], u[:end-start])
+		copy(dk[start:end], result[:end-start])
 	}
 
 	return dk

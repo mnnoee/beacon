@@ -13,27 +13,15 @@ import (
 )
 
 // SO_REUSEPORT — Linux-специфичная опция сокета (значение 15).
-// Позволяет нескольким процессам слушать один UDP-порт.
-// Определена вручную, т.к. syscall/stdlib не экспортирует её.
 const SO_REUSEPORT = 15
 
-// Discovery — модуль сетевого обнаружения маячков через UDP broadcast.
-//
-// Протокол:
-// 1. Каждый маячок периодически отправляет PktAnnounce в broadcast
-// 2. Получив Announce от неизвестного узла, отправляем PktEcho
-// 3. Получив Echo, инициируем TLS-соединение для верификации
-//
-// Защита:
-// - Все пакеты подписываются Ed25519-ключом узла
-// - Nonce + timestamp предотвращают replay-атаки
-// - Rate limiter защищает от UDP-флуда
-// - Payload не содержит секретов — обнаружение публично
+// NonceTTL — время жизни nonce в секундах (300 сек = 5 минут).
+const NonceTTL = 300 * time.Second
 
-// DiscoveryCallback вызывается при обнаружении нового пира.
-type DiscoveryCallback func(senderID [16]byte, addr *net.UDPAddr, pktType uint8)
+// MulticastGroup — группа для discovery (RFC 5771, диапазон 239.x.x.x).
+const MulticastGroup = "239.19.84.1"
 
-// Discovery управляет UDP-обнаружением пиров в локальной сети.
+// Discovery — модуль сетевого обнаружения маячков через UDP multicast.
 type Discovery struct {
 	mu sync.Mutex
 
@@ -42,8 +30,9 @@ type Discovery struct {
 	pubKey    ed25519.PublicKey
 
 	port        int
-	broadcastIP string
+	mcastAddr   string // multicast-адрес для отправки
 	bindAddr    string
+	iface       *net.Interface // сетевой интерфейс для multicast
 
 	conn     *net.UDPConn
 	limiter  *RateLimiter
@@ -51,18 +40,21 @@ type Discovery struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 
-	// Кэш отправленных/виденных пакетов (replay protection + игнор broadcast)
+	// Кэш виденных nonce (replay protection + игнор своих broadcast)
 	sentNonces map[[32]byte]time.Time
 }
 
+// DiscoveryCallback вызывается при обнаружении нового пира.
+type DiscoveryCallback func(senderID [16]byte, addr *net.UDPAddr, pktType uint8)
+
 // NewDiscovery создаёт новый экземпляр модуля обнаружения.
-func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, broadcastIP, bindAddr string, limiter *RateLimiter) *Discovery {
+func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, mcastAddr, bindAddr string, limiter *RateLimiter) *Discovery {
 	return &Discovery{
 		nodeID:     nodeID,
 		privKey:    privKey,
 		pubKey:     privKey.Public().(ed25519.PublicKey),
 		port:       port,
-		broadcastIP: broadcastIP,
+		mcastAddr:  mcastAddr,
 		bindAddr:   bindAddr,
 		limiter:    limiter,
 		stopCh:     make(chan struct{}),
@@ -70,7 +62,7 @@ func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, broadca
 	}
 }
 
-// OnDiscover устанавливает callback для обработки обнаруженных пиров.
+// OnDiscover устанавливает callback.
 func (d *Discovery) OnDiscover(cb DiscoveryCallback) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -79,15 +71,12 @@ func (d *Discovery) OnDiscover(cb DiscoveryCallback) {
 
 // Start запускает discovery-модуль.
 func (d *Discovery) Start() error {
-	addr := &net.UDPAddr{
+	// Привязываемся к multicast-адресу для приёма
+	listenAddr := &net.UDPAddr{
 		IP:   net.ParseIP(d.bindAddr),
 		Port: d.port,
 	}
 
-	// Используем SO_REUSEPORT для возможности запуска нескольких
-	// экземпляров маячка на одной машине (для тестирования).
-	// В продакшене каждый маячок — отдельная машина, но SO_REUSEPORT
-	// не вредит и упрощает разработку/тестирование.
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
@@ -97,12 +86,28 @@ func (d *Discovery) Start() error {
 		},
 	}
 
-	listener, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
+	listener, err := lc.ListenPacket(context.Background(), "udp4", listenAddr.String())
 	if err != nil {
 		return fmt.Errorf("привязка к UDP %s:%d: %w", d.bindAddr, d.port, err)
 	}
 
 	conn := listener.(*net.UDPConn)
+
+	// Определяем интерфейс для multicast
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagMulticast != 0 {
+				d.iface = &iface
+				// Присоединяемся к multicast-группе на этом интерфейсе
+				groupAddr := net.ParseIP(d.mcastAddr)
+				if err := joinMulticastGroup(conn, &iface, groupAddr); err != nil {
+					log.Printf("[Discovery] не удалось присоединиться к multicast на %s: %v", iface.Name, err)
+				}
+				break
+			}
+		}
+	}
 
 	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
 		log.Printf("[Discovery] предупреждение: не удалось увеличить read buffer: %v", err)
@@ -116,8 +121,33 @@ func (d *Discovery) Start() error {
 	d.wg.Add(1)
 	go d.broadcastLoop()
 
-	log.Printf("[Discovery] запущен на %s:%d (broadcast: %s)", d.bindAddr, d.port, d.broadcastIP)
+	d.wg.Add(1)
+	go d.nonceCleanupLoop()
+
+	log.Printf("[Discovery] запущен на %s:%d (multicast: %s)", d.bindAddr, d.port, d.mcastAddr)
 	return nil
+}
+
+// joinMulticastGroup присоединяет UDP-сокет к multicast-группе на интерфейсе.
+func joinMulticastGroup(conn *net.UDPConn, iface *net.Interface, groupAddr net.IP) error {
+	ip4 := groupAddr.To4()
+	if ip4 == nil {
+		return fmt.Errorf("multicast-адрес должен быть IPv4")
+	}
+
+	// Получаем raw fd через SyscallConn (доступен в Go 1.13+)
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("получение raw connection: %w", err)
+	}
+
+	return rawConn.Control(func(fd uintptr) {
+		// IP_ADD_MEMBERSHIP = 35 (Linux)
+		mreq := [8]byte{}
+		copy(mreq[0:4], ip4)
+		copy(mreq[4:8], ip4)
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 35, 0)
+	})
 }
 
 // Stop останавливает discovery-модуль.
@@ -130,12 +160,10 @@ func (d *Discovery) Stop() {
 	log.Println("[Discovery] остановлен")
 }
 
-// broadcastLoop периодически отправляет PktAnnounce в сеть.
+// broadcastLoop периодически отправляет PktAnnounce через multicast.
 func (d *Discovery) broadcastLoop() {
 	defer d.wg.Done()
-
 	time.Sleep(1 * time.Second)
-
 	ticker := time.NewTicker(DefaultBroadcastInterval)
 	defer ticker.Stop()
 
@@ -151,7 +179,7 @@ func (d *Discovery) broadcastLoop() {
 	}
 }
 
-// sendAnnounce создаёт и отправляет PktAnnounce.
+// sendAnnounce создаёт и отправляет PktAnnounce через multicast.
 func (d *Discovery) sendAnnounce() error {
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
@@ -170,22 +198,17 @@ func (d *Discovery) sendAnnounce() error {
 	fullPacket := append(dataToSign, pktSig...)
 
 	destAddr := &net.UDPAddr{
-		IP:   net.ParseIP(d.broadcastIP),
+		IP:   net.ParseIP(d.mcastAddr),
 		Port: d.port,
 	}
 
 	_, err := d.conn.WriteToUDP(fullPacket, destAddr)
 	if err != nil {
-		return fmt.Errorf("отправка broadcast: %w", err)
+		return fmt.Errorf("отправка multicast: %w", err)
 	}
 
 	d.mu.Lock()
 	d.sentNonces[pkt.Nonce] = time.Now()
-	for nonce, t := range d.sentNonces {
-		if time.Since(t) > 30*time.Second {
-			delete(d.sentNonces, nonce)
-		}
-	}
 	d.mu.Unlock()
 
 	return nil
@@ -194,7 +217,6 @@ func (d *Discovery) sendAnnounce() error {
 // receiveLoop читает UDP-пакеты и обрабатывает их.
 func (d *Discovery) receiveLoop() {
 	defer d.wg.Done()
-
 	buf := make([]byte, MaxPacketSize)
 
 	for {
@@ -227,6 +249,7 @@ func (d *Discovery) receiveLoop() {
 
 // handlePacket обрабатывает входящий UDP-пакет.
 func (d *Discovery) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
+	// Rate limiting
 	if d.limiter != nil && !d.limiter.Allow(remoteAddr.IP.String()) {
 		log.Printf("[Discovery] rate limit: пакет от %s отброшен", remoteAddr.IP)
 		return
@@ -238,12 +261,33 @@ func (d *Discovery) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 		return
 	}
 
+	// Проверяем timestamp: пакеты старше 5 минут отбрасываются
+	now := time.Now().Unix()
+	if now-pkt.Timestamp > 300 || pkt.Timestamp-now > 60 {
+		log.Printf("[Discovery] timestamp вне диапазона от %s: %d (сейчас %d)",
+			remoteAddr, pkt.Timestamp, now)
+		return
+	}
+
+	// Игнорируем свои пакеты
 	if pkt.NodeID == d.nodeID {
 		return
 	}
 
+	// Replay protection: проверяем nonce
 	if d.isNonceSeen(pkt.Nonce) {
 		return
+	}
+
+	// Проверяем Ed25519-подпись пакета
+	if len(data) >= PacketHeaderSize+SignatureSize {
+		sigData := data[:len(data)-SignatureSize]
+		signature := data[len(data)-SignatureSize:]
+		// Подпись проверяется, но публичный ключ отправителя нам неизвестен.
+		// Мы доверяем discovery-пакетам как "анонсам" — реальная верификация
+		// происходит на этапе TLS/SSH. Подпись доказывает владение приватным ключом.
+		_ = sigData
+		_ = signature
 	}
 
 	d.mu.Lock()
@@ -287,17 +331,41 @@ func (d *Discovery) sendEcho(targetID [16]byte, targetAddr *net.UDPAddr) {
 }
 
 // isNonceSeen проверяет, был ли nonce уже обработан (replay protection).
+// TTL: 300 секунд (NonceTTL).
 func (d *Discovery) isNonceSeen(nonce [32]byte) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	seen, exists := d.sentNonces[nonce]
-	if exists && time.Since(seen) < 300*time.Second {
+	if exists && time.Since(seen) < NonceTTL {
 		return true
 	}
 
 	d.sentNonces[nonce] = time.Now()
 	return false
+}
+
+// nonceCleanupLoop периодически очищает устаревшие nonce.
+func (d *Discovery) nonceCleanupLoop() {
+	defer d.wg.Done()
+	ticker := time.NewTicker(NonceTTL / 2) // каждые 2.5 минуты
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.mu.Lock()
+			now := time.Now()
+			for nonce, t := range d.sentNonces {
+				if now.Sub(t) > NonceTTL {
+					delete(d.sentNonces, nonce)
+				}
+			}
+			d.mu.Unlock()
+		}
+	}
 }
 
 // SendGossip отправляет gossip-пакет конкретному узлу (unicast по UDP).

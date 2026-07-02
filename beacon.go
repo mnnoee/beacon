@@ -70,12 +70,14 @@ func NewBeaconNode(cfg *Config) (*BeaconNode, error) {
 		return nil, fmt.Errorf("инициализация ключей: %w", err)
 	}
 
-	if err := node.loadTLSConfig(); err != nil {
-		return nil, fmt.Errorf("инициализация TLS: %w", err)
-	}
-
+	// TrustStore загружается ДО TLS, т.к. TLSClientConfig проверяет
+	// сертификаты пиров через TrustStore
 	if err := node.loadTrustStore(); err != nil {
 		return nil, fmt.Errorf("загрузка Trust Store: %w", err)
+	}
+
+	if err := node.loadTLSConfig(); err != nil {
+		return nil, fmt.Errorf("инициализация TLS: %w", err)
 	}
 
 	log.Printf("[Beacon] узел инициализирован: ID=%X CN=%s", node.nodeID, node.config.NodeName)
@@ -143,7 +145,7 @@ func (b *BeaconNode) loadTLSConfig() error {
 	}
 	b.tlsServerConfig = serverConfig
 
-	clientConfig, err := TLSClientConfig(certPath, keyPath, caPath)
+	clientConfig, err := TLSClientConfig(certPath, keyPath, caPath, b.trustStore)
 	if err != nil {
 		return err
 	}
@@ -176,6 +178,10 @@ func (b *BeaconNode) loadTrustStore() error {
 		return err
 	}
 	b.trustStore = ts
+
+	// Загружаем Ed25519 ключи для проверки gossip-подписей
+	b.trustStore.RegisterEd25519KeyFromDisk(b.config.DataDir)
+
 	return nil
 }
 

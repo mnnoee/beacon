@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
@@ -16,11 +18,6 @@ import (
 // - Клиент проверяет сертификат сервера через RootCAs (наш CA)
 // - Сертификат клиента проверяется сервером через ClientCAs (наш CA)
 // - Обе стороны используют сертификаты, подписанные общим CA
-//
-// Это гарантирует:
-// 1. MITM-атака невозможна (нет доверия к чужому CA)
-// 2. Только авторизованные маячки могут подключиться
-// 3. Каждая сторона знает, с кем общается (CN в сертификате)
 func TLSConfigForNode(certPath, keyPath, caCertPath string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
@@ -41,22 +38,56 @@ func TLSConfigForNode(certPath, keyPath, caCertPath string) (*tls.Config, error)
 		Certificates: []tls.Certificate{cert},
 		ClientCAs:    caCertPool,
 		RootCAs:      caCertPool,
-		// Mutual TLS: требуем сертификат от клиента и проверяем через ClientCAs
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		MinVersion: tls.VersionTLS12,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
 	}
 
 	return config, nil
 }
 
-// TLSClientConfig создаёт tls.Config специфично для клиента
-// (отключает проверку hostname, т.к. в P2P-сети нет DNS).
-func TLSClientConfig(certPath, keyPath, caCertPath string) (*tls.Config, error) {
+// TLSClientConfig создаёт tls.Config для клиента.
+// Вместо InsecureSkipVerify использует VerifyPeerCertificate,
+// который проверяет сертификат пира через TrustStore (CA + CRL).
+func TLSClientConfig(certPath, keyPath, caCertPath string, ts *TrustStore) (*tls.Config, error) {
 	config, err := TLSConfigForNode(certPath, keyPath, caCertPath)
 	if err != nil {
 		return nil, err
 	}
+
+	// В P2P-сети нет DNS — подключаемся по IP.
+	// Стандартная hostname-проверка не нужна, но цепочка доверия обязательна.
 	config.InsecureSkipVerify = true
+
+	// VerifyPeerCertificate заменяет hostname-проверку на проверку через TrustStore:
+	// 1. Сертификат пира подписан нашим CA
+	// 2. Сертификат не отозван (CRL)
+	// 3. CN используется как логический идентификатор
+	config.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("пир не предоставил сертификат")
+		}
+		peerCert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("парсинг сертификата пира: %w", err)
+		}
+		if ts != nil {
+			if !ts.IsTrusted(peerCert) {
+				return fmt.Errorf("сертификат пира не доверен (CN=%s)", peerCert.Subject.CommonName)
+			}
+		} else {
+			// Fallback: проверка через RootCAs без CRL
+			opts := x509.VerifyOptions{
+				Roots:     config.RootCAs,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+			}
+			if _, err := peerCert.Verify(opts); err != nil {
+				return fmt.Errorf("верификация сертификата пира: %w", err)
+			}
+		}
+		log.Printf("[TLS] пир верифицирован: CN=%s", peerCert.Subject.CommonName)
+		return nil
+	}
+
 	return config, nil
 }
 
@@ -84,9 +115,37 @@ func TLSClientDial(addr string, config *tls.Config) (*tls.Conn, error) {
 	return conn, nil
 }
 
+// LoadECDSAKey загружает ECDSA приватный ключ из PEM.
+func LoadECDSAKey(path string) (*ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("не удалось декодировать PEM")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("парсинг ключа: %w", err)
+	}
+	return key, nil
+}
+
+// LoadECDSACert загружает сертификат из PEM.
+func LoadECDSACert(path string) (*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("не удалось декодировать PEM")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
 // GenerateToken генератор криптографически стойкого токена.
-// Используется для offline-provisioning: токен передаётся на USB/файле,
-// а не по сети, что исключает MITM при первой настройке.
 func GenerateToken(length int) ([]byte, error) {
 	token := make([]byte, length)
 	if _, err := rand.Read(token); err != nil {

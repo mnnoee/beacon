@@ -45,7 +45,6 @@ type SSHServer struct {
 	idleTimeout  time.Duration
 	stopCh       chan struct{}
 	connCloseCh  chan struct{} // сигнал закрытия всех соединений
-	authorized   map[string]string // fingerprint -> CN
 }
 
 // NewSSHServer создаёт новый SSH-сервер на основе ключей и Trust Store маячка.
@@ -71,11 +70,7 @@ func NewSSHServer(cfg *Config, ts *TrustStore) (*SSHServer, error) {
 		idleTimeout: cfg.SSHIdleTimeout,
 		stopCh:      make(chan struct{}),
 		connCloseCh: make(chan struct{}),
-		authorized:  make(map[string]string),
 	}
-
-	// Загружаем авторизованные ключи из TrustStore
-	srv.loadAuthorizedKeys()
 
 	// Настраиваем SSH-конфигурацию
 	srv.sshConfig = &ssh.ServerConfig{
@@ -97,55 +92,53 @@ func NewSSHServer(cfg *Config, ts *TrustStore) (*SSHServer, error) {
 	return srv, nil
 }
 
-func (s *SSHServer) loadAuthorizedKeys() {
+// authorize проверяет SSH-ключ клиента через TrustStore в реальном времени.
+// Каждое подключение проверяется актуальным состоянием TrustStore (CRL).
+func (s *SSHServer) authorize(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+	fp := ssh.FingerprintSHA256(pubKey)
+
+	// Ищем сертификат с совпадающим публичным ключом
 	for _, cert := range s.trustStore.getTrustedCerts() {
 		if cert.PublicKey == nil {
 			continue
 		}
-		// Пропускаем отозванные сертификаты
-		h := ComputeSerialHash(cert)
-		if s.trustStore.IsRevoked(h) {
-			log.Printf("[SSH] пропущен отозванный ключ: CN=%s", cert.Subject.CommonName)
-			continue
-		}
+
 		sshPubKey, err := ssh.NewPublicKey(cert.PublicKey)
 		if err != nil {
 			continue
 		}
-		fp := ssh.FingerprintSHA256(sshPubKey)
-		s.authorized[fp] = cert.Subject.CommonName
-		log.Printf("[SSH] авторизован ключ: CN=%s fingerprint=%s",
-			cert.Subject.CommonName, fp)
+
+		if ssh.FingerprintSHA256(sshPubKey) == fp {
+			// Нашли совпадение — проверяем CRL в реальном времени
+			h := ComputeSerialHash(cert)
+			if s.trustStore.IsRevoked(h) {
+				log.Printf("[SSH] отклонено: сертификат отозван CN=%s addr=%s",
+					cert.Subject.CommonName, conn.RemoteAddr())
+				return nil, fmt.Errorf("certificate revoked")
+			}
+
+			// Проверяем срок действия
+			if cert.NotAfter.Before(time.Now()) {
+				log.Printf("[SSH] отклонено: сертификат просрочен CN=%s addr=%s",
+					cert.Subject.CommonName, conn.RemoteAddr())
+				return nil, fmt.Errorf("certificate expired")
+			}
+
+			log.Printf("[SSH] авторизован: CN=%s addr=%s fingerprint=%s",
+				cert.Subject.CommonName, conn.RemoteAddr(), fp)
+
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"pubkey-cn": cert.Subject.CommonName,
+					"pubkey-fp": fp,
+				},
+			}, nil
+		}
 	}
-}
 
-// authorize проверяет SSH-ключ клиента.
-//
-// Процесс:
-// 1. Вычисляем fingerprint SSH-ключа
-// 2. Ищем совпадение среди сертификатов, подписанных нашим CA
-// 3. Проверяем CRL (не отозван)
-// 4. Проверяем срок действия
-// 5. CN сертификата используется как username
-func (s *SSHServer) authorize(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-	fp := ssh.FingerprintSHA256(pubKey)
-
-	cn, ok := s.authorized[fp]
-	if !ok {
-		log.Printf("[SSH] отклонено: ключ не авторизован addr=%s fingerprint=%s",
-			conn.RemoteAddr(), fp)
-		return nil, fmt.Errorf("public key not authorized")
-	}
-
-	log.Printf("[SSH] авторизован: CN=%s addr=%s fingerprint=%s",
-		cn, conn.RemoteAddr(), fp)
-
-	return &ssh.Permissions{
-		Extensions: map[string]string{
-			"pubkey-cn": cn,
-			"pubkey-fp": fp,
-		},
-	}, nil
+	log.Printf("[SSH] отклонено: ключ не авторизован addr=%s fingerprint=%s",
+		conn.RemoteAddr(), fp)
+	return nil, fmt.Errorf("public key not authorized")
 }
 
 // Start запускает SSH-сервер.
