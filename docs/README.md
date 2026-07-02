@@ -46,7 +46,7 @@
 | SSH | golang.org/x/crypto/ssh |
 | TUI | bubbletea + lipgloss + go-runewidth |
 | Шифрование ключей | AES-256-GCM + PBKDF2 (600K итераций) |
-| Trust Store | CA + CRL + gossip + peers.txt |
+| Trust Store | CA + CRL + gossip |
 | Rate Limiting | Token bucket (per IP) |
 
 ### Безопасность

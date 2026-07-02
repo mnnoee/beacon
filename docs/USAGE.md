@@ -43,17 +43,6 @@ scp -r ./data/beacon-nas nas:~/beacon-data/
 scp ./data/ca/ca-cert.pem nas:~/beacon-data/ca/
 ```
 
-### 4. Создание peers.txt
-
-Для автоматического пинга создайте `~/beacon-data/peers.txt`:
-
-```
-# Список пиров (имя IP)
-beacon-nas 192.168.1.4
-beacon-tablet 192.168.1.214
-beacon-router 192.168.1.19
-```
-
 ### 5. Запуск
 
 ```bash

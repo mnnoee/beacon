@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
 	"net"
@@ -198,7 +197,7 @@ func max(a, b int) int {
 func loadPeers(cfg *Config, ts *TrustStore) []peerInfo {
 	var peers []peerInfo
 
-	// From TrustStore (names only)
+	// Только из TrustStore — имена из сертификатов
 	if ts != nil {
 		for _, cert := range ts.getTrustedCerts() {
 			cn := cert.Subject.CommonName
@@ -206,38 +205,6 @@ func loadPeers(cfg *Config, ts *TrustStore) []peerInfo {
 				continue
 			}
 			peers = append(peers, peerInfo{Name: cn, Port: cfg.TLSPort})
-		}
-	}
-
-	// From peers.txt (name + IP)
-	f, err := os.Open(cfg.DataDir + "/peers.txt")
-	if err == nil {
-		defer f.Close()
-		known := make(map[string]bool)
-		for _, p := range peers {
-			known[p.Name] = true
-		}
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			parts := strings.Fields(line)
-			if len(parts) < 2 {
-				continue
-			}
-			name, ip := parts[0], parts[1]
-			if known[name] {
-				for i := range peers {
-					if peers[i].Name == name {
-						peers[i].IP = ip
-						peers[i].Port = cfg.TLSPort
-					}
-				}
-			} else {
-				peers = append(peers, peerInfo{Name: name, IP: ip, Port: cfg.TLSPort})
-			}
 		}
 	}
 
