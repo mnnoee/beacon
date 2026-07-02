@@ -407,7 +407,15 @@ func (b *BeaconNode) tlsServerLoop() {
 }
 
 // handleIncomingTLS обрабатывает входящее TLS-соединение.
+// В Go TLS handshake ленивый — выполняется при первом Read/Write.
+// Обязательно вызываем Handshake() до проверки сертификатов.
 func (b *BeaconNode) handleIncomingTLS(conn *tls.Conn) {
+	if err := conn.Handshake(); err != nil {
+		log.Printf("[Beacon] TLS handshake не удался с %s: %v", conn.RemoteAddr(), err)
+		conn.Close()
+		return
+	}
+
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		log.Printf("[Beacon] входящее соединение без сертификата от %s", conn.RemoteAddr())
