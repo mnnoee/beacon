@@ -10,259 +10,238 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/term"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-type PeerStatus int
+var (
+	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	styleHeader = lipgloss.NewStyle().Bold(true)
+	styleOnline = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	styleOffline = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	styleUnknown = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleDim    = lipgloss.NewStyle().Faint(true)
+)
+
+type peerStatus int
 
 const (
-	StatusUnknown PeerStatus = iota
-	StatusOnline
-	StatusOffline
+	statusUnknown peerStatus = iota
+	statusOnline
+	statusOffline
 )
 
-func (s PeerStatus) String() string {
-	switch s {
-	case StatusOnline:
-		return "ONLINE"
-	case StatusOffline:
-		return "OFFLINE"
-	default:
-		return "???"
-	}
-}
-
-type PeerInfo struct {
+type peerInfo struct {
 	Name    string
 	IP      string
 	Port    int
-	Status  PeerStatus
+	Status  peerStatus
 	Ping    time.Duration
 	LastTry time.Time
 }
 
-type Monitor struct {
-	mu       sync.Mutex
-	peers    []*PeerInfo
-	cfg      *Config
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	name     string
-	uptime   time.Time
+type tickMsg time.Time
+
+type model struct {
+	peers  []peerInfo
+	name   string
+	width  int
+	height int
+	quitting bool
 }
 
-func NewMonitor(cfg *Config, ts *TrustStore) *Monitor {
-	m := &Monitor{
-		cfg:    cfg,
-		peers:  make([]*PeerInfo, 0),
-		stopCh: make(chan struct{}),
-		name:   cfg.NodeName,
-		uptime: time.Now(),
-	}
-	m.loadFromTrustStore(ts)
-	m.loadPeersFile()
-	return m
+func (m model) Init() tea.Cmd {
+	return tea.Batch(tickCmd(), tea.EnterAltScreen)
 }
 
-func (m *Monitor) loadFromTrustStore(ts *TrustStore) {
-	if ts == nil {
-		return
-	}
-	for _, cert := range ts.getTrustedCerts() {
-		cn := cert.Subject.CommonName
-		if cn == "Root CA" || cn == "" || cn == m.name {
-			continue
-		}
-		m.peers = append(m.peers, &PeerInfo{
-			Name: cn,
-			Port: m.cfg.TLSPort,
-		})
-	}
+func tickCmd() tea.Cmd {
+	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
-func (m *Monitor) loadPeersFile() {
-	f, err := os.Open(m.cfg.DataDir + "/peers.txt")
-	if err != nil {
-		return
-	}
-	defer f.Close()
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
 
-	known := make(map[string]bool)
-	for _, p := range m.peers {
-		known[p.Name] = true
-	}
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		name, ip := parts[0], parts[1]
-
-		if known[name] {
-			for _, p := range m.peers {
-				if p.Name == name {
-					p.IP = ip
-					p.Port = m.cfg.TLSPort
-				}
-			}
-		} else {
-			m.peers = append(m.peers, &PeerInfo{
-				Name: name,
-				IP:   ip,
-				Port: m.cfg.TLSPort,
-			})
-		}
-	}
-}
-
-func (m *Monitor) Stop() {
-	m.stopOnce.Do(func() { close(m.stopCh) })
-}
-
-func (m *Monitor) Run() error {
-	old, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		return fmt.Errorf("raw mode: %w", err)
-	}
-	defer term.Restore(int(os.Stdin.Fd()), old)
-
-	go m.pingLoop()
-	go m.inputLoop()
-
-	m.render()
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.stopCh:
-			return nil
-		case <-ticker.C:
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "r":
 			m.pingAll()
-			m.render()
+			return m, nil
 		}
+
+	case tickMsg:
+		m.pingAll()
+		return m, tickCmd()
 	}
+
+	return m, nil
 }
 
-func (m *Monitor) render() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	fmt.Print("\033[H\033[2J")
+func (m model) View() string {
+	if m.quitting {
+		return ""
+	}
 
 	online := 0
 	for _, p := range m.peers {
-		if p.Status == StatusOnline {
+		if p.Status == statusOnline {
 			online++
 		}
 	}
 
-	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Printf("║  Network Beacons Monitor                               ║\n")
-	fmt.Println("╠══════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Узел: %-10s  Пиров: %d (онлайн: %d)              ║\n", m.name, len(m.peers), online)
-	fmt.Println("╠══════════════════════════════════════════════════════════╣")
-	fmt.Println("║  Имя              IP               Статус    Пинг      ║")
-	fmt.Println("║  ──────────────── ──────────────── ──────── ──────────  ║")
+	var b strings.Builder
 
-	if len(m.peers) == 0 {
-		fmt.Println("║  (нет пиров)                                           ║")
-	}
+	// Title
+	b.WriteString(styleTitle.Render("  Network Beacons Monitor"))
+	b.WriteString("\n")
 
+	// Info line
+	info := fmt.Sprintf("  Узел: %s  |  Пиров: %d (онлайн: %d)", m.name, len(m.peers), online)
+	b.WriteString(info)
+	b.WriteString("\n\n")
+
+	// Table header
+	b.WriteString(styleHeader.Render("  Имя"))
+	b.WriteString(strings.Repeat(" ", max(1, 18-4)))
+	b.WriteString(styleHeader.Render("IP"))
+	b.WriteString(strings.Repeat(" ", max(1, 16-2)))
+	b.WriteString(styleHeader.Render("Статус"))
+	b.WriteString(strings.Repeat(" ", max(1, 10-6)))
+	b.WriteString(styleHeader.Render("Пинг"))
+	b.WriteString("\n")
+	b.WriteString(styleDim.Render(strings.Repeat("─", 56)))
+	b.WriteString("\n")
+
+	// Rows
 	for _, p := range m.peers {
-		name := p.Name
-		if len(name) > 16 {
-			name = name[:13] + "..."
-		}
+		name := truncate(p.Name, 16)
 		ip := p.IP
 		if ip == "" {
 			ip = "—"
 		}
-		status := p.Status.String()
-		ping := "—"
-		if p.Ping > 0 {
-			ping = fmt.Sprintf("%dms", p.Ping.Milliseconds())
-		}
-		fmt.Printf("║  %-16s %-15s %-8s %-8s ║\n", name, ip, status, ping)
-	}
 
-	fmt.Println("╠══════════════════════════════════════════════════════════╣")
-	fmt.Println("║  [Q] Выход  [R] Ping всех                              ║")
-	fmt.Println("╚══════════════════════════════════════════════════════════╝")
-}
-
-func (m *Monitor) inputLoop() {
-	buf := make([]byte, 1)
-	for {
-		select {
-		case <-m.stopCh:
-			return
+		var statusStr string
+		switch p.Status {
+		case statusOnline:
+			statusStr = styleOnline.Render("ONLINE")
+		case statusOffline:
+			statusStr = styleOffline.Render("OFFLINE")
 		default:
+			statusStr = styleUnknown.Render("???")
 		}
-		os.Stdin.Read(buf)
-		if buf[0] == 'q' || buf[0] == 'Q' || buf[0] == 3 {
-			m.Stop()
-			return
+
+		pingStr := "—"
+		if p.Ping > 0 {
+			pingStr = fmt.Sprintf("%dms", p.Ping.Milliseconds())
 		}
-		if buf[0] == 'r' || buf[0] == 'R' {
-			m.pingAll()
-			m.render()
-		}
+
+		b.WriteString(fmt.Sprintf("  %-16s %-15s %-17s %s\n", name, ip, statusStr, pingStr))
 	}
+
+	b.WriteString("\n")
+	b.WriteString(styleDim.Render("  [q] Выход  [r] Ping всех"))
+	b.WriteString("\n")
+
+	return b.String()
 }
 
-func (m *Monitor) pingLoop() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-m.stopCh:
-			return
-		case <-ticker.C:
-			m.pingAll()
-			m.render()
-		}
-	}
-}
-
-func (m *Monitor) pingAll() {
-	m.mu.Lock()
-	list := make([]*PeerInfo, len(m.peers))
-	copy(list, m.peers)
-	m.mu.Unlock()
-
+func (m *model) pingAll() {
 	var wg sync.WaitGroup
-	for _, p := range list {
-		if p.IP == "" {
+	for i := range m.peers {
+		if m.peers[i].IP == "" {
 			continue
 		}
 		wg.Add(1)
-		go func(peer *PeerInfo) {
+		go func(idx int) {
 			defer wg.Done()
+			p := &m.peers[idx]
 			start := time.Now()
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", peer.IP, peer.Port), 3*time.Second)
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", p.IP, p.Port), 3*time.Second)
 			latency := time.Since(start)
 
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			peer.LastTry = time.Now()
 			if err != nil {
-				peer.Status = StatusOffline
-				peer.Ping = 0
+				p.Status = statusOffline
+				p.Ping = 0
 			} else {
 				conn.Close()
-				peer.Status = StatusOnline
-				peer.Ping = latency
+				p.Status = statusOnline
+				p.Ping = latency
 			}
-		}(p)
+			p.LastTry = time.Now()
+		}(i)
 	}
 	wg.Wait()
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-3] + "..."
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func loadPeers(cfg *Config, ts *TrustStore) []peerInfo {
+	var peers []peerInfo
+
+	// From TrustStore (names only)
+	if ts != nil {
+		for _, cert := range ts.getTrustedCerts() {
+			cn := cert.Subject.CommonName
+			if cn == "Root CA" || cn == "" || cn == cfg.NodeName {
+				continue
+			}
+			peers = append(peers, peerInfo{Name: cn, Port: cfg.TLSPort})
+		}
+	}
+
+	// From peers.txt (name + IP)
+	f, err := os.Open(cfg.DataDir + "/peers.txt")
+	if err == nil {
+		defer f.Close()
+		known := make(map[string]bool)
+		for _, p := range peers {
+			known[p.Name] = true
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			name, ip := parts[0], parts[1]
+			if known[name] {
+				for i := range peers {
+					if peers[i].Name == name {
+						peers[i].IP = ip
+						peers[i].Port = cfg.TLSPort
+					}
+				}
+			} else {
+				peers = append(peers, peerInfo{Name: name, IP: ip, Port: cfg.TLSPort})
+			}
+		}
+	}
+
+	return peers
 }
 
 func RunMonitor(cfg *Config) error {
@@ -273,11 +252,17 @@ func RunMonitor(cfg *Config) error {
 		ts, _ = NewTrustStore(caPath, crlPath)
 	}
 
-	monitor := NewMonitor(cfg, ts)
-	defer monitor.Stop()
+	peers := loadPeers(cfg, ts)
+
+	m := model{
+		peers: peers,
+		name:  cfg.NodeName,
+	}
 
 	log.SetOutput(os.Stderr)
-	log.Printf("[Monitor] %s: %d пиров", cfg.NodeName, len(monitor.peers))
+	log.Printf("[Monitor] %s: %d пиров", cfg.NodeName, len(peers))
 
-	return monitor.Run()
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	_, err := p.Run()
+	return err
 }
