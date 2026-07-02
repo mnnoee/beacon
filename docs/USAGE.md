@@ -9,8 +9,8 @@ go build -o beacon
 # aarch64 (Android/Termux, Raspberry Pi)
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o beacon-arm64
 
-# aarch64 Linux
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o beacon-arm64
+# mipsle (роутеры OpenWrt)
+GOOS=linux GOARCH=mipsle CGO_ENABLED=0 GOMIPS=softfloat go build -o beacon-mipsle
 ```
 
 ## Быстрый старт
@@ -28,9 +28,9 @@ beacon ca generate-ca -dir ./data
 ### 2. Выдача сертификатов
 
 ```bash
-beacon ca provision-beacon -dir ./data roter
 beacon ca provision-beacon -dir ./data nas
-beacon ca provision-beacon -dir ./data ap-top
+beacon ca provision-beacon -dir ./data tablet
+beacon ca provision-beacon -dir ./data router
 ```
 
 Для каждого: `data/beacon-<имя>/cert.pem` + `key.pem`
@@ -43,21 +43,38 @@ scp -r ./data/beacon-nas nas:~/beacon-data/
 scp ./data/ca/ca-cert.pem nas:~/beacon-data/ca/
 ```
 
-### 4. Запуск
+### 4. Создание peers.txt
+
+Для автоматического пинга создайте `~/beacon-data/peers.txt`:
+
+```
+# Список пиров (имя IP)
+beacon-nas 192.168.1.4
+beacon-tablet 192.168.1.214
+beacon-router 192.168.1.19
+```
+
+### 5. Запуск
 
 ```bash
 # На каждом узле:
 beacon beacon -dir ~/beacon-data -name beacon-<имя> \
-  -broadcast 192.168.1.255 -ssh-port 2222
+  -broadcast 255.255.255.255 -ssh-port 2222
 ```
 
-### 5. SSH
+### 6. Монитор
+
+```bash
+beacon monitor -dir ~/beacon-data -name beacon-<имя>
+```
+
+TUI на bubbletea+lipgloss: таблица пиров, статус ONLINE/OFFLINE, пинг каждые 3 сек.
+Управление: `q` — выход, `r` — ping всех.
+
+### 7. SSH
 
 ```bash
 # Подключение по IP
-beacon ssh -name beacon-my-node 192.168.1.10:2222
-
-# Выполнение команды
 beacon ssh -name beacon-my-node 192.168.1.10:2222 "uname -a"
 
 # Интерактивный shell
@@ -68,13 +85,15 @@ beacon ssh -name beacon-my-node 192.168.1.10:2222
 
 ### Control Node (CA)
 
-```bash
-beacon ca generate-ca -dir <дир>
-beacon ca provision-beacon -dir <дир> <имя>
-beacon ca revoke-beacon -dir <дир> <hex-serial>
-beacon ca list-trusted -dir <дир>
-beacon ca import-ca -dir <дир> <путь>
-```
+| Команда | Описание |
+|---------|----------|
+| `ca generate-ca` | Генерация корневого CA |
+| `ca provision-beacon <имя>` | Выдача сертификата маячку |
+| `ca revoke-beacon <hex>` | Отзыв сертификата |
+| `ca list-trusted` | Список доверенных узлов |
+| `ca import-ca <путь>` | Импорт CA-сертификата |
+| `ca export-ca` | Экспорт CA-файлов для копирования |
+| `ca sync-crl <host:path>` | Синхронизация CRL с другой CA |
 
 ### Beacon Node
 
@@ -106,7 +125,18 @@ beacon ssh [опции] <цель> [команда]
 |-------|----------|
 | `-name` | Имя этого маячка (для аутентификации) |
 | `-dir` | Директория с ключами |
-| `-p` | Порт SSH (переопределяет авто) |
+| `-p` | Порт SSH |
+
+### TUI-монитор
+
+```bash
+beacon monitor [опции]
+```
+
+| Опция | Описание |
+|-------|----------|
+| `-name` | Имя этого маячка |
+| `-dir` | Директория с данными |
 
 ## Примеры
 
@@ -123,23 +153,31 @@ beacon beacon -dir ~/data -name beacon-nas -broadcast 192.168.1.255
 beacon beacon -dir ~/data -name beacon-ap -broadcast 192.168.1.255
 ```
 
+### Dual CA
+
+```bash
+# На первой машине (уже есть CA)
+beacon ca generate-ca -dir ./data
+beacon ca export-ca -dir ./data
+
+# На второй машине
+scp user@first:~/data/ca/* ~/beacon-data/ca/
+beacon ca list-trusted -dir ~/beacon-data
+```
+
 ### Отзыв узла
 
 ```bash
-# Найти serial hash
 beacon ca list-trusted -dir ./data
-
-# Отозвать
-beacon ca revoke-beacon -dir ./data <serial-hash>
-
-# CRL распространится через gossip автоматически
+beacon ca revoke-beacon -dir ./data <hex-serial>
+# CRL автоматически через gossip
 ```
 
-### Кросс-компиляция для aarch64
+### Кросс-компиляция
 
 ```bash
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o beacon-arm64
-scp beacon-arm64 target-host:~/beacon
+GOOS=linux GOARCH=mipsle CGO_ENABLED=0 GOMIPS=softfloat go build -o beacon-mipsle
 ```
 
 ## Тестирование
@@ -154,6 +192,6 @@ go test -v -count=1 ./...
 - Gossip CRL merge
 - Wire protocol serialization
 - Rate limiter
-- AES-256-GCM + PBKDF2 шифрование
+- AES-256-GCM + PBKDF2
 - SSH: валидный/отозванный/самоподписанный сертификат
 - SSH exec-команды
