@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -338,13 +339,16 @@ func DeserializeCRL(data []byte) ([]RevokedEntry, error) {
 // ComputeSerialHash вычисляет 16-байтовый хеш от distinguished name сертификата.
 // Используется как серийный номер в CRL (вместо случайного serial).
 func ComputeSerialHash(cert *x509.Certificate) [16]byte {
-	import_sha256 := func(data []byte) [16]byte {
-		// Используем SHA-256 и обрезаем до 16 байт — достаточно для уникальности
-		h := [16]byte{}
-		copy(h[:], data[:16])
-		return h
+	// Используем RawSubject/RawIssuer если доступны (парсинг из DER),
+	// иначе fallback на CommonName (для шаблонов/тестов).
+	var data []byte
+	if len(cert.RawSubject) > 0 {
+		data = append(cert.RawSubject, cert.RawIssuer...)
+	} else {
+		data = []byte(cert.Subject.CommonName)
 	}
-	// Простое хеширование Subject+Issuer для идентификации
-	combined := append(cert.RawSubject, cert.RawIssuer...)
-	return import_sha256(combined)
+	h := sha256.Sum256(data)
+	var result [16]byte
+	copy(result[:], h[:16])
+	return result
 }

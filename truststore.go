@@ -5,8 +5,12 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"sync"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // TrustStore — локальное хранилище доверия.
@@ -25,10 +29,11 @@ import (
 // - Gossip-обновления проверяются подписью (подпись = подпись CA)
 // - Максимальный размер CRL ограничен (MaxCRLSize)
 type TrustStore struct {
-	mu       sync.RWMutex
-	caCert   *x509.Certificate
-	caPool   *x509.CertPool
-	revoked  map[[16]byte]RevokedEntry // serialHash -> entry
+	mu          sync.RWMutex
+	caCert      *x509.Certificate
+	caPool      *x509.CertPool
+	revoked     map[[16]byte]RevokedEntry // serialHash -> entry
+	trustedCerts []*x509.Certificate      // доверенные сертификаты (подписанные CA)
 	crlVersion uint32
 	diskPath string
 }
@@ -36,8 +41,9 @@ type TrustStore struct {
 // NewTrustStore создаёт новый Trust Store и загружает данные с диска.
 func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	ts := &TrustStore{
-		caPool:  x509.NewCertPool(),
-		revoked: make(map[[16]byte]RevokedEntry),
+		caPool:      x509.NewCertPool(),
+		revoked:     make(map[[16]byte]RevokedEntry),
+		trustedCerts: make([]*x509.Certificate, 0),
 	}
 
 	// Загружаем CA-сертификат
@@ -60,6 +66,9 @@ func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	ts.caPool.AddCert(caCert)
 	ts.diskPath = crlPath
 
+	// Загружаем доверенные сертификаты из поддиректорий
+	ts.loadTrustedCertsFromDisk(caCertPath)
+
 	// Загружаем CRL, если существует
 	if err := ts.LoadCRL(); err != nil {
 		// CRL может не существовать при первом запуске — это нормально
@@ -67,6 +76,51 @@ func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	}
 
 	return ts, nil
+}
+
+// loadTrustedCertsFromDisk загружает доверенные сертификаты из поддиректорий.
+// Структура: <caDir>/../beacon-*/cert.pem
+func (ts *TrustStore) loadTrustedCertsFromDisk(caCertPath string) {
+	// Определяем корневую директорию данных
+	// caCertPath = <dataDir>/ca/ca-cert.pem → dataDir = <dataDir>
+	dataDir := filepath.Dir(filepath.Dir(caCertPath))
+	if dataDir == "." || dataDir == "/" {
+		return
+	}
+
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "ca" {
+			continue
+		}
+		certPath := filepath.Join(dataDir, entry.Name(), "cert.pem")
+		certData, err := os.ReadFile(certPath)
+		if err != nil {
+			continue
+		}
+		block, _ := pem.Decode(certData)
+		if block == nil {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		// Проверяем что сертификат подписан нашим CA
+		opts := x509.VerifyOptions{
+			Roots:     ts.caPool,
+			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}
+		if _, err := cert.Verify(opts); err == nil {
+			ts.trustedCerts = append(ts.trustedCerts, cert)
+			log.Printf("[TrustStore] загружен доверенный сертификат: %s (CN=%s)",
+				certPath, cert.Subject.CommonName)
+		}
+	}
 }
 
 // LoadCRL загружает CRL с диска.
@@ -243,4 +297,56 @@ func (ts *TrustStore) VerifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509
 func Fingerprint(cert *x509.Certificate) string {
 	hash := sha256.Sum256(cert.Raw)
 	return fmt.Sprintf("%X", hash)
+}
+
+// FindCertBySSHKey ищет сертификат в TrustStore по SSH-публичному ключу.
+// Сравнивает fingerprint SSH-ключа с fingerprint публичного ключа из сертификата.
+func (ts *TrustStore) FindCertBySSHKey(sshPubKey ssh.PublicKey) (*x509.Certificate, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	sshFingerprint := ssh.FingerprintSHA256(sshPubKey)
+
+	opts := x509.VerifyOptions{
+		Roots:     ts.caPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}
+
+	// Ищем среди доверенных сертификатов
+	for _, trustedCert := range ts.getTrustedCerts() {
+		if trustedCert.PublicKey == nil {
+			continue
+		}
+
+		// Конвертируем x509 публичный ключ в SSH-формат через ssh.NewPublicKey
+		sshTrustedKey, err := ssh.NewPublicKey(trustedCert.PublicKey)
+		if err != nil {
+			continue
+		}
+		trustedFingerprint := ssh.FingerprintSHA256(sshTrustedKey)
+
+		if trustedFingerprint == sshFingerprint {
+			// Проверяем подпись CA
+			if _, verifyErr := trustedCert.Verify(opts); verifyErr != nil {
+				return nil, fmt.Errorf("сертификат не прошёл верификацию: %w", verifyErr)
+			}
+			h := ComputeSerialHash(trustedCert)
+			if _, revoked := ts.revoked[h]; revoked {
+				return nil, fmt.Errorf("сертификат отозван")
+			}
+			return trustedCert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("SSH-ключ не найден в TrustStore")
+}
+
+// getTrustedCerts возвращает список доверенных сертификатов (CA + подписанные CA).
+func (ts *TrustStore) getTrustedCerts() []*x509.Certificate {
+	result := make([]*x509.Certificate, 0, 1+len(ts.trustedCerts))
+	if ts.caCert != nil {
+		result = append(result, ts.caCert)
+	}
+	result = append(result, ts.trustedCerts...)
+	return result
 }

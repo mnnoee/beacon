@@ -80,6 +80,11 @@ type Config struct {
 	RateLimitRate    float64 // Средняя скорость (пакетов/сек)
 	MaxConnsPerPeer  int     // Максимум одновременных TLS-соединений с одним пиром
 
+	// --- Параметры SSH-сервера ---
+	SSHPort        int           // TCP-порт SSH-сервера
+	SSHMaxConns    int           // Максимум одновременных SSH-подключений
+	SSHIdleTimeout time.Duration // Тайм-аут неактивности для SSH
+
 	// --- Provisioning ---
 	ProvisionToken  string // Токен для offline-provisioning нового маячка
 	ProvisionName   string // Имя нового маячка для выдачи сертификата
@@ -97,6 +102,9 @@ func DefaultConfig() *Config {
 		RateLimitBurst:  10,
 		RateLimitRate:   2.0,
 		MaxConnsPerPeer: 5,
+		SSHPort:         2222,
+		SSHMaxConns:     10,
+		SSHIdleTimeout:  10 * time.Minute,
 	}
 }
 

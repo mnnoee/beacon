@@ -50,6 +50,7 @@ type BeaconNode struct {
 
 	trustStore *TrustStore
 	discovery  *Discovery
+	sshServer  *SSHServer
 
 	peers map[[16]byte]*DiscoveredPeer
 
@@ -204,8 +205,29 @@ func (b *BeaconNode) Start() error {
 	b.wg.Add(1)
 	go b.healthCheckLoop()
 
+	// Запускаем SSH-сервер
+	b.startSSHServer()
+
 	log.Println("[Beacon] узел запущен и готов к обнаружению")
 	return nil
+}
+
+// startSSHServer запускает встроенный SSH-сервер.
+func (b *BeaconNode) startSSHServer() {
+	sshSrv, err := NewSSHServer(b.config, b.trustStore)
+	if err != nil {
+		log.Printf("[Beacon] не удалось создать SSH-сервер: %v", err)
+		return
+	}
+
+	b.sshServer = sshSrv
+	if err := sshSrv.Start(); err != nil {
+		log.Printf("[Beacon] не удалось запустить SSH-сервер: %v", err)
+		b.sshServer = nil
+		return
+	}
+
+	log.Printf("[Beacon] SSH-сервер запущен на порту %d", b.config.SSHPort)
 }
 
 // Stop останавливает все подсистемы.
@@ -213,6 +235,9 @@ func (b *BeaconNode) Stop() {
 	close(b.stopCh)
 	if b.discovery != nil {
 		b.discovery.Stop()
+	}
+	if b.sshServer != nil {
+		b.sshServer.Stop()
 	}
 
 	b.mu.Lock()

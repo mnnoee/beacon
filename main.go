@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -24,6 +25,8 @@ func main() {
 		cmdCA(os.Args[2:])
 	case "beacon":
 		cmdBeacon(os.Args[2:])
+	case "ssh":
+		cmdSSH(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -39,6 +42,7 @@ func printUsage() {
 Использование:
   beacon ca <команда>       — операции Главной Ноды (CA)
   beacon beacon             — запуск Маячка
+  beacon ssh <цель>         — SSH-подключение к маячку
 
 Команды CA:
   generate-ca              — генерация корневого CA
@@ -46,6 +50,11 @@ func printUsage() {
   revoke-beacon <serial>   — отзыв сертификата маячка
   list-trusted             — список доверенных узлов
   import-ca <путь>         — импорт CA-сертификата из файла
+
+SSH:
+  beacon ssh <ip:port>     — подключение по IP
+  beacon ssh <имя>         — подключение по имени (через discovery)
+  beacon ssh <ip> "cmd"    — выполнение команды
 
 Примеры:
   # Сгенерировать CA
@@ -57,6 +66,13 @@ func printUsage() {
   # Запустить маячок
   beacon beacon -name beacon-node-1 -bind 0.0.0.0
 
+  # Подключиться по SSH
+  beacon ssh 192.168.1.10
+  beacon ssh beacon-nas
+
+  # Выполнить команду
+  beacon ssh 192.168.1.10 "uname -a"
+
   # Отозвать сертификат
   beacon ca revoke-beacon <serial-hash-hex>
 
@@ -65,7 +81,43 @@ func printUsage() {
   - UDP discovery-пакеты подписываются Ed25519
   - Защита от replay-атак (nonce + timestamp)
   - Rate limiting для защиты от UDP-флуда
-  - Ключи хранятся на диске с ограничением прав (0600)`)
+   - Ключи хранятся на диске с ограничением прав (0600)`)
+}
+
+// cmdSSH обрабатывает SSH-подключения к маячкам.
+func cmdSSH(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "укажите цель: beacon ssh <ip:port | имя-маячка> [команда]")
+		os.Exit(1)
+	}
+
+	fs := flag.NewFlagSet("ssh", flag.ExitOnError)
+	dataDir := fs.String("dir", "./beacon-data", "директория с данными")
+	nodeName := fs.String("name", "", "имя этого маячка (для аутентификации)")
+	sshPort := fs.Int("p", 0, "порт SSH (переопределяет авто)")
+
+	fs.Parse(args)
+
+	target := fs.Arg(0)
+	execCmd := fs.Arg(1) // может быть пустым
+
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "укажите цель: beacon ssh -name <имя> <ip:port | имя-маячка> [команда]")
+		os.Exit(1)
+	}
+
+	cfg := DefaultConfig()
+	cfg.DataDir = *dataDir
+	cfg.NodeName = *nodeName
+	if *sshPort > 0 {
+		cfg.SSHPort = *sshPort
+	}
+
+	client := NewSSHClient(cfg)
+	if err := client.Connect(target, execCmd); err != nil {
+		fmt.Fprintf(os.Stderr, "ошибка: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // cmdCA обрабатывает команды Главной Ноды (CA).
@@ -281,8 +333,16 @@ func cmdBeacon(args []string) {
 	fs.IntVar(&cfg.TLSPort, "tls-port", cfg.TLSPort, "TCP-порт TLS")
 	fs.Float64Var(&cfg.RateLimitRate, "rate-limit", cfg.RateLimitRate, "макс. пакетов/сек от одного IP")
 	fs.IntVar(&cfg.RateLimitBurst, "rate-burst", cfg.RateLimitBurst, "макс. burst пакетов")
+	fs.IntVar(&cfg.SSHPort, "ssh-port", cfg.SSHPort, "TCP-порт SSH-сервера")
+	fs.IntVar(&cfg.SSHMaxConns, "ssh-max-conns", cfg.SSHMaxConns, "макс. SSH-подключений")
+	var idleTimeout time.Duration
+	fs.DurationVar(&idleTimeout, "ssh-idle-timeout", cfg.SSHIdleTimeout, "idle timeout SSH")
 
 	fs.Parse(args)
+
+	if idleTimeout > 0 {
+		cfg.SSHIdleTimeout = idleTimeout
+	}
 
 	if cfg.NodeName == "" {
 		fmt.Fprintln(os.Stderr, "укажите имя маячка: beacon beacon -name <имя>")
@@ -291,8 +351,9 @@ func cmdBeacon(args []string) {
 
 	// Логируем конфигурацию
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Printf("[Main] запуск маячка '%s' (discovery: %s:%d, tls: %s:%d)",
-		cfg.NodeName, cfg.BroadcastAddr, cfg.DiscoveryPort, cfg.BindAddr, cfg.TLSPort)
+	log.Printf("[Main] запуск маячка '%s' (discovery: %s:%d, tls: %s:%d, ssh: %s:%d)",
+		cfg.NodeName, cfg.BroadcastAddr, cfg.DiscoveryPort,
+		cfg.BindAddr, cfg.TLSPort, cfg.BindAddr, cfg.SSHPort)
 
 	// Создаём и запускаем узел
 	node, err := NewBeaconNode(cfg)
