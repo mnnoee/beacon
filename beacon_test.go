@@ -344,50 +344,135 @@ func TestTrustStoreRevocation(t *testing.T) {
 	IssueCertificate(caKey, certPEM, dir, "revoke-me", DefaultCertTTL)
 
 	ts, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
-	certData, _ := os.ReadFile(dir + "/revoke-me/cert.pem")
-	block, _ := pem.Decode(certData)
-	cert, _ := x509.ParseCertificate(block.Bytes)
+	cert, err := loadCertPEM(dir + "/revoke-me/cert.pem")
+	if err != nil {
+		t.Fatalf("загрузка сертификата: %v", err)
+	}
 
 	if !ts.IsTrusted(cert) {
-		t.Fatal("should be trusted before revoke")
+		t.Fatal("сертификат должен быть доверен до отзыва")
 	}
 
-	h := ComputeSerialHash(cert)
-	ts.Revoke(h, 1)
+	if err := ts.Revoke(cert.SerialNumber, 1); err != nil {
+		t.Fatalf("отзыв: %v", err)
+	}
 
 	if ts.IsTrusted(cert) {
-		t.Fatal("should NOT be trusted after revoke")
+		t.Fatal("отозванный сертификат не должен быть доверен")
 	}
 
+	// CRL должен пережить перезапуск процесса.
 	ts2, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
-	if !ts2.IsRevoked(h) {
-		t.Fatal("CRL must persist to disk")
+	if !ts2.IsRevokedBySerial(cert.SerialNumber) {
+		t.Fatal("CRL должен сохраняться на диск")
+	}
+	if ts2.IsTrusted(cert) {
+		t.Fatal("после перезагрузки CRL сертификат всё ещё должен быть отозван")
 	}
 }
 
+// TestRevocationDoesNotAffectReissuedCert — регресс на главный дефект прежней
+// схемы: отзыв сертификата не должен задевать новый, выпущенный на то же имя.
+func TestRevocationDoesNotAffectReissuedCert(t *testing.T) {
+	dir := t.TempDir()
+	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
+	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
+
+	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL)
+	if err != nil {
+		t.Fatalf("первая выдача: %v", err)
+	}
+
+	firstCert, _ := loadCertPEM(first.CertPath)
+
+	// Устройство потеряло ключ — пере-выдача на то же имя.
+	if err := ArchiveCertIfPresent(dir, "beacon-flaky"); err != nil {
+		t.Fatalf("архивирование: %v", err)
+	}
+
+	second, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL)
+	if err != nil {
+		t.Fatalf("пере-выдача: %v", err)
+	}
+
+	secondCert, _ := loadCertPEM(second.CertPath)
+
+	// Оба сертификата имеют одинаковый CN — как в реальном деплое.
+	if firstCert.Subject.CommonName != secondCert.Subject.CommonName {
+		t.Fatal("CN должен совпадать")
+	}
+	if firstCert.SerialNumber.Cmp(secondCert.SerialNumber) == 0 {
+		t.Fatal("серийники должны различаться")
+	}
+
+	ts, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
+
+	// Отзываем старый (утерянный) сертификат.
+	if err := ts.Revoke(firstCert.SerialNumber, 1); err != nil {
+		t.Fatalf("отзыв старого: %v", err)
+	}
+
+	// Новый обязан остаться рабочим — прежняя схема ломала его здесь.
+	if !ts.IsTrusted(secondCert) {
+		t.Fatal("отзыв старого сертификата не должен задевать пере-выданный")
+	}
+	if ts.IsTrusted(firstCert) {
+		t.Fatal("старый сертификат должен быть отозван")
+	}
+}
+
+// TestGossipCRLMerge — регресс на дефект версий CRL.
+//
+// Прежний код отбрасывал gossip, если senderVersion <= localVersion. Номер
+// CRL жил только в памяти и обнулялся при каждом запуске, поэтому два свежих
+// узла имели одинаковый номер и отзывы не расходились ВООБЩЕ. Теперь отзывы
+// принимаются всегда: CRL только растёт, объединение безопасно.
 func TestGossipCRLMerge(t *testing.T) {
 	dir := t.TempDir()
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
-	IssueCertificate(caKey, certPEM, dir, "gossip-node", DefaultCertTTL)
-	ts, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
 
-	certData, _ := os.ReadFile(dir + "/gossip-node/cert.pem")
-	block, _ := pem.Decode(certData)
-	cert, _ := x509.ParseCertificate(block.Bytes)
-	h := ComputeSerialHash(cert)
-	ts.Revoke(h, 1)
-
-	entries := []RevokedEntry{{SerialHash: h, RevokedAt: time.Now().Unix(), Reason: 1}}
-
-	// Старая версия — не применять
-	if ts.MergeGossipCRL(0, entries) {
-		t.Fatal("old version must not merge")
+	issued, err := IssueCertificate(caKey, certPEM, dir, "gossip-node", DefaultCertTTL)
+	if err != nil {
+		t.Fatalf("IssueCertificate: %v", err)
 	}
 
-	// Новая версия — применять
-	if !ts.MergeGossipCRL(ts.CRLVersion()+1, entries) {
-		t.Fatal("new version must merge")
+	cert, _ := loadCertPEM(issued.CertPath)
+
+	ts, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
+	if err := ts.Revoke(cert.SerialNumber, 1); err != nil {
+		t.Fatalf("отзыв: %v", err)
+	}
+
+	// Узел-получатель, у которого НИЧЕГО не отозвано.
+	receiver, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl-empty.pem")
+
+	entries := []revokedCert{{
+		SerialNumber: cert.SerialNumber,
+		RevokedAt:    time.Now(),
+		Reason:       1,
+	}}
+
+	// Именно этот случай раньше отбрасывался: номера равны.
+	if !receiver.MergeGossipCRL(receiver.CRLVersion(), entries) {
+		t.Fatalf("gossip с равным номером должен приниматься (номер получателя=%d)",
+			receiver.CRLVersion())
+	}
+
+	if !receiver.IsRevokedBySerial(cert.SerialNumber) {
+		t.Fatal("отзыв должен был примениться")
+	}
+
+	// Повторное применение тех же записей не должно ничего ломать.
+	if receiver.MergeGossipCRL(receiver.CRLVersion(), entries) {
+		t.Fatal("повторное применение идентичных записей не должно считаться изменением")
+	}
+
+	// Чужой CRL не должен понижать наш номер.
+	high := receiver.CRLVersion()
+	receiver.MergeGossipCRL(1, nil)
+	if receiver.CRLVersion() != high {
+		t.Fatal("номер CRL не должен уменьшаться")
 	}
 }
 
@@ -435,20 +520,55 @@ func TestProtocolSerialization(t *testing.T) {
 		t.Fatal("пакет версии 1 должен отвергаться")
 	}
 
-	// Gossip roundtrip
+	// Gossip roundtrip: серийники произвольной длины должны пережить
+	// сериализацию как текст.
 	g := &GossipPayload{
-		CRLVersion: 7,
-		RevokedEntries: []RevokedEntry{
-			{SerialHash: [16]byte{1, 2, 3}, RevokedAt: 12345, Reason: 1},
+		Number: 7,
+		RevokedEntries: []revokedCert{
+			{
+				SerialNumber: big.NewInt(12345),
+				RevokedAt:    time.Unix(1700000000, 0),
+				Reason:       1,
+			},
+			{
+				// Максимальный 128-битный серийник
+				SerialNumber: new(big.Int).Lsh(big.NewInt(1), 128),
+				RevokedAt:    time.Unix(1700000001, 0),
+				Reason:       2,
+			},
 		},
 	}
-	gd, _ := SerializeGossipPayload(g)
+	gd, err := SerializeGossipPayload(g)
+	if err != nil {
+		t.Fatalf("SerializeGossipPayload: %v", err)
+	}
 	pg, err := DeserializeGossipPayload(gd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pg.CRLVersion != 7 || len(pg.RevokedEntries) != 1 {
-		t.Fatal("gossip mismatch")
+	if pg.Number != 7 {
+		t.Fatalf("номер CRL не совпал: %d", pg.Number)
+	}
+	if len(pg.RevokedEntries) != 2 {
+		t.Fatalf("число записей не совпало: %d", len(pg.RevokedEntries))
+	}
+	for i, want := range g.RevokedEntries {
+		got := pg.RevokedEntries[i]
+		if got.SerialNumber.Cmp(want.SerialNumber) != 0 {
+			t.Fatalf("серийник #%d: получили %s, ждали %s",
+				i, got.SerialNumber, want.SerialNumber)
+		}
+		if !got.RevokedAt.Equal(want.RevokedAt) {
+			t.Fatalf("время #%d: получили %v, ждали %v", i, got.RevokedAt, want.RevokedAt)
+		}
+		if got.Reason != want.Reason {
+			t.Fatalf("причина #%d: получили %d, ждали %d", i, got.Reason, want.Reason)
+		}
+	}
+
+	// Обрезка должна отвергаться, а не читаться как мусор.
+	if _, err := DeserializeGossipPayload(gd[:len(gd)-3]); err == nil {
+		t.Fatal("обрезанный gossip payload должен отвергаться")
 	}
 }
 

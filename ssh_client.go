@@ -47,11 +47,17 @@ func (c *SSHClient) Connect(target, execCmd string) error {
 		return fmt.Errorf("создание SSH signer: %w", err)
 	}
 
-	// Проверка хост-ключа через TrustStore вместо InsecureIgnoreHostKey
-	hostKeyCallback := ssh.InsecureIgnoreHostKey()
-	if c.trustStore != nil {
-		hostKeyCallback = c.trustStore.VerifyHostKey
+	// Проверка host-ключа через TrustStore.
+	//
+	// Раньше здесь стоял InsecureIgnoreHostKey на случай, если TrustStore не
+	// загрузился, — то есть при любой проблеме с CA проверка молча
+	// отключалась, и MITM получал сессию. Теперь отсутствие TrustStore — это
+	// ошибка: подключаться без возможности проверить host-ключ нельзя.
+	if c.trustStore == nil {
+		return fmt.Errorf("TrustStore не загружен: проверять host-ключ нечем. " +
+			"Проверьте наличие ca/ca-cert.pem в каталоге данных и права на файл")
 	}
+	hostKeyCallback := ssh.HostKeyCallback(c.trustStore.VerifyHostKey)
 
 	sshConfig := &ssh.ClientConfig{
 		User: "beacon",

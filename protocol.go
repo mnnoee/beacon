@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"net"
 	"time"
 )
@@ -173,74 +174,105 @@ func (p *DiscoveryPacket) DataToSign() []byte {
 // GossipPayload — полезная нагрузка для PktGossip-пакетов.
 // Содержит обновления CRL (список отозванных сертификатов).
 type GossipPayload struct {
-	// Версия CRL отправителя (счетчик, увеличивается при каждом отзыве)
-	CRLVersion uint32
+	// Number — номер CRL отправителя (CRLNumber из x509.RevocationList).
+	// Монотонный и переживает перезапуск, в отличие от прежнего счётчика
+	// в памяти, который обнулялся при каждом запуске процесса.
+	Number uint64
 
-	// Список отозванных серийных номеров (каждый 16 байт — SHA-256 от DN)
-	RevokedEntries []RevokedEntry
+	// RevokedEntries — отозванные сертификаты, по серийному номеру.
+	RevokedEntries []revokedCert
 }
 
-// RevokedEntry — одна запись об отозванном сертификате.
-type RevokedEntry struct {
-	// Серийный номер сертификата (SHA-256 от distinguished name, 16 байт)
-	SerialHash [16]byte
+// maxGossipEntries ограничивает число отзывов в одном gossip-пакете.
+const maxGossipEntries = 1000
 
-	// Время отзыва (Unix seconds)
-	RevokedAt int64
-
-	// Причина отзыва (0 — не определена, 1 — компрометация ключа, 2 — выход из сети)
-	Reason uint8
-}
+// gossipMaxSerialLen — максимальная длина серийника в десятичной записи.
+// Серийники выпускаются 128-битными, но 39 символов дают запас.
+const gossipMaxSerialLen = 39
 
 // SerializeGossipPayload кодирует gossip-нагрузку в байты.
+//
+//	[8 байт Number]
+//	[запись: serialLen(1) serial(serialLen) revokedAt(8) reason(1)]*
+//
+// Серийник кодируется текстом десятичной записи: это читаемо при дампе пакета
+// и не зависит от длины big.Int, как было бы при побайтовом кодировании.
 func SerializeGossipPayload(g *GossipPayload) ([]byte, error) {
-	if len(g.RevokedEntries) > 1000 {
-		return nil, fmt.Errorf("слишком много записей в CRL gossip: %d (макс 1000)", len(g.RevokedEntries))
+	if len(g.RevokedEntries) > maxGossipEntries {
+		return nil, fmt.Errorf("слишком много записей в CRL gossip: %d (макс %d)",
+			len(g.RevokedEntries), maxGossipEntries)
 	}
 
-	size := 4 + len(g.RevokedEntries)*25 // 4(версия) + N*(16+8+1)
-	buf := make([]byte, size)
+	buf := make([]byte, 8, 8+len(g.RevokedEntries)*(gossipMaxSerialLen+10))
+	binary.BigEndian.PutUint64(buf, g.Number)
 
-	binary.BigEndian.PutUint32(buf[0:4], g.CRLVersion)
-
-	offset := 4
 	for _, entry := range g.RevokedEntries {
-		copy(buf[offset:offset+16], entry.SerialHash[:])
-		binary.BigEndian.PutUint64(buf[offset+16:offset+24], uint64(entry.RevokedAt))
-		buf[offset+24] = entry.Reason
-		offset += 25
+		if entry.SerialNumber == nil {
+			continue
+		}
+
+		serial := []byte(entry.SerialNumber.String())
+		if len(serial) > gossipMaxSerialLen {
+			return nil, fmt.Errorf("слишком длинный серийник для gossip: %d байт", len(serial))
+		}
+
+		buf = append(buf, uint8(len(serial)))
+		buf = append(buf, serial...)
+
+		var timeBuf [8]byte
+		binary.BigEndian.PutUint64(timeBuf[:], uint64(entry.RevokedAt.Unix()))
+		buf = append(buf, timeBuf[:]...)
+		buf = append(buf, entry.Reason)
 	}
 
 	return buf, nil
 }
 
-// DeserializeGossipPayload декодирует gossip-нагрузку.
+// DeserializeGossipPayload разбирает gossip-нагрузку из байтов.
 func DeserializeGossipPayload(data []byte) (*GossipPayload, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("gossip payload слишком короток")
+	if len(data) < 8 {
+		return nil, fmt.Errorf("gossip payload слишком короткий")
 	}
 
-	crlVersion := binary.BigEndian.Uint32(data[0:4])
-	remaining := data[4:]
+	number := binary.BigEndian.Uint64(data[:8])
 
-	if len(remaining)%25 != 0 {
-		return nil, fmt.Errorf("неверная длина gossip payload: %d (должно быть кратно 25)", len(remaining))
-	}
+	rest := data[8:]
+	entries := make([]revokedCert, 0, 16)
 
-	count := len(remaining) / 25
-	entries := make([]RevokedEntry, count)
+	for len(rest) > 0 {
+		if len(rest) < 1+8+1 {
+			return nil, fmt.Errorf("обрыв записи в gossip payload")
+		}
 
-	for i := 0; i < count; i++ {
-		base := i * 25
-		var entry RevokedEntry
-		copy(entry.SerialHash[:], remaining[base:base+16])
-		entry.RevokedAt = int64(binary.BigEndian.Uint64(remaining[base+16 : base+24]))
-		entry.Reason = remaining[base+24]
-		entries[i] = entry
+		serialLen := int(rest[0])
+		rest = rest[1:]
+
+		if serialLen == 0 || serialLen > gossipMaxSerialLen {
+			return nil, fmt.Errorf("некорректная длина серийника в gossip: %d", serialLen)
+		}
+		if len(rest) < serialLen+8+1 {
+			return nil, fmt.Errorf("обрыв записи в gossip payload")
+		}
+
+		serial := new(big.Int)
+		if _, ok := serial.SetString(string(rest[:serialLen]), 10); !ok {
+			return nil, fmt.Errorf("некорректный серийник в gossip payload")
+		}
+		rest = rest[serialLen:]
+
+		revokedAt := int64(binary.BigEndian.Uint64(rest[:8]))
+		reason := rest[8]
+		rest = rest[9:]
+
+		entries = append(entries, revokedCert{
+			SerialNumber: serial,
+			RevokedAt:    time.Unix(revokedAt, 0),
+			Reason:       reason,
+		})
 	}
 
 	return &GossipPayload{
-		CRLVersion:     crlVersion,
+		Number:         number,
 		RevokedEntries: entries,
 	}, nil
 }

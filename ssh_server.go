@@ -110,8 +110,7 @@ func (s *SSHServer) authorize(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh
 
 		if ssh.FingerprintSHA256(sshPubKey) == fp {
 			// Нашли совпадение — проверяем CRL в реальном времени
-			h := ComputeSerialHash(cert)
-			if s.trustStore.IsRevoked(h) {
+			if s.trustStore.IsRevoked(cert) {
 				log.Printf("[SSH] отклонено: сертификат отозван CN=%s addr=%s",
 					cert.Subject.CommonName, conn.RemoteAddr())
 				return nil, fmt.Errorf("certificate revoked")

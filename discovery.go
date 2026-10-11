@@ -469,9 +469,9 @@ func (d *Discovery) nonceCleanupLoop() {
 //
 // Пакет подписывается, но получатель не проверяет подпись: gossip принимается
 // только по уже установленному mTLS-соединению (см. BeaconNode.handleGossip).
-func (d *Discovery) SendGossip(targetAddr *net.UDPAddr, crlVersion uint32, entries []RevokedEntry) error {
+func (d *Discovery) SendGossip(targetAddr *net.UDPAddr, number uint64, entries []revokedCert) error {
 	gossipPayload := &GossipPayload{
-		CRLVersion:     crlVersion,
+		Number:         number,
 		RevokedEntries: entries,
 	}
 

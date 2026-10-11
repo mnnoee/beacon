@@ -295,105 +295,37 @@ func LoadCACert(path string) (*x509.Certificate, error) {
 	return ParseCertificatePEM(data)
 }
 
-// RevokeCertificate добавляет сертификат в CRL.
-// serialNumber — SHA-256 хеш от distinguished name сертификата (16 байт).
-// reason: 0=не определена, 1=компрометация ключа, 2=выход из сети.
-func RevokeCertificate(dataDir string, serialHash [16]byte, reason uint8) error {
-	crlPath := filepath.Join(dataDir, "ca", "crl.pem")
-
-	// Загружаем существующий CRL или создаём новый
-	existing, _ := os.ReadFile(crlPath)
-	var revoked []RevokedEntry
-
-	if len(existing) > 0 {
-		crlBlock, _ := pem.Decode(existing)
-		if crlBlock != nil {
-			var err error
-			revoked, err = DeserializeCRL(crlBlock.Bytes)
-			if err != nil {
-				return fmt.Errorf("десериализация существующего CRL: %w", err)
-			}
-		}
+// RevokeCertificate отзывает сертификат по его серийному номеру.
+//
+// Отзывы пишутся в CRL, подписанный ключом CA (x509.RevocationList), поэтому
+// узел может проверить подлинность списка и не принимает файл, полученный
+// не из сети.
+//
+// reason: 0=не определена, 1=комрометация ключа, 2=выход из сети.
+func RevokeCertificate(dataDir string, serial *big.Int, reason uint8) error {
+	if serial == nil {
+		return fmt.Errorf("серийный номер не задан")
 	}
 
-	// Проверяем, не отозван ли уже
-	for _, entry := range revoked {
-		if entry.SerialHash == serialHash {
-			return fmt.Errorf("сертификат уже отозван")
-		}
-	}
+	caDir := filepath.Join(dataDir, "ca")
+	crlPath := filepath.Join(caDir, "crl.pem")
 
-	revoked = append(revoked, RevokedEntry{
-		SerialHash: serialHash,
-		RevokedAt:  time.Now().Unix(),
-		Reason:     reason,
-	})
-
-	crlData, err := SerializeCRL(revoked)
+	store, err := LoadCRLStore(crlPath,
+		filepath.Join(caDir, "ca-cert.pem"),
+		filepath.Join(caDir, "ca-key.pem"))
 	if err != nil {
-		return fmt.Errorf("сериализация CRL: %w", err)
+		return err
 	}
 
-	crlPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "X509 CRL",
-		Bytes: crlData,
-	})
-
-	return os.WriteFile(crlPath, crlPEM, 0644)
-}
-
-// SerializeCRL кодирует CRL в простой бинарный формат.
-// Формат: [4 байта count] + count * [16(serial) + 8(time) + 1(reason)]
-func SerializeCRL(entries []RevokedEntry) ([]byte, error) {
-	size := 4 + len(entries)*25
-	buf := make([]byte, size)
-
-	// count в big-endian
-	buf[0] = byte(len(entries) >> 24)
-	buf[1] = byte(len(entries) >> 16)
-	buf[2] = byte(len(entries) >> 8)
-	buf[3] = byte(len(entries))
-
-	for i, entry := range entries {
-		base := 4 + i*25
-		copy(buf[base:base+16], entry.SerialHash[:])
-		buf[base+16] = byte(entry.RevokedAt >> 56)
-		buf[base+17] = byte(entry.RevokedAt >> 48)
-		buf[base+18] = byte(entry.RevokedAt >> 40)
-		buf[base+19] = byte(entry.RevokedAt >> 32)
-		buf[base+20] = byte(entry.RevokedAt >> 24)
-		buf[base+21] = byte(entry.RevokedAt >> 16)
-		buf[base+22] = byte(entry.RevokedAt >> 8)
-		buf[base+23] = byte(entry.RevokedAt)
-		buf[base+24] = entry.Reason
+	if store.IsRevoked(serial) {
+		return fmt.Errorf("сертификат %s уже отозван", serial)
 	}
 
-	return buf, nil
-}
-
-// DeserializeCRL декодирует CRL из бинарного формата.
-func DeserializeCRL(data []byte) ([]RevokedEntry, error) {
-	if len(data) < 4 {
-		return nil, fmt.Errorf("CRL слишком короткий")
+	if err := store.Revoke(serial, reason); err != nil {
+		return fmt.Errorf("отзыв сертификата: %w", err)
 	}
 
-	count := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if len(data) < 4+count*25 {
-		return nil, fmt.Errorf("CRL: неверная длина (ожидается %d, получено %d)", 4+count*25, len(data))
-	}
-
-	entries := make([]RevokedEntry, count)
-	for i := 0; i < count; i++ {
-		base := 4 + i*25
-		copy(entries[i].SerialHash[:], data[base:base+16])
-		entries[i].RevokedAt = int64(data[base+16])<<56 | int64(data[base+17])<<48 |
-			int64(data[base+18])<<40 | int64(data[base+19])<<32 |
-			int64(data[base+20])<<24 | int64(data[base+21])<<16 |
-			int64(data[base+22])<<8 | int64(data[base+23])
-		entries[i].Reason = data[base+24]
-	}
-
-	return entries, nil
+	return nil
 }
 
 // ComputeSerialHash вычисляет 16-байтовый хеш от distinguished name сертификата.

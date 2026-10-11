@@ -4,7 +4,6 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log"
@@ -12,8 +11,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -22,25 +21,20 @@ import (
 //
 // Содержит:
 // 1. Корневой сертификат CA — для проверки подписей на сертификатах пиров
-// 2. Список отозванных сертификатов (CRL) — для отклонения скомпрометированных узлов
+// 2. CRL на базе crypto/x509 — для отклонения отозванных узлов
+// 3. Ключи подписей Ed25519 соседей — для проверки gossip
 //
-// Trust Store обновляется:
-// - При запуске (загрузка с диска)
-// - Через gossip-протокол (при P2P-контакте с другими маячками)
-// - При кратковременном подключении к Главной Ноде (опционально)
-//
-// Защита от атак:
-// - CA-сертификат загружается ТОЛЬКО с диска, не по сети
-// - Gossip-обновления проверяются подписью (подпись = подпись CA)
-// - Максимальный размер CRL ограничен (MaxCRLSize)
+// Отзывы keyed по настоящему серийному номеру сертификата. Прежняя схема
+// использовала 16-байтовый хеш от CN, из-за чего пере-выдача сертификата на то
+// же имя давала тот же ключ: отзыв старого убивал новый, а новый не отзывался
+// вовсе.
 type TrustStore struct {
 	mu           sync.RWMutex
 	caCert       *x509.Certificate
 	caPool       *x509.CertPool
-	revoked      map[[16]byte]RevokedEntry      // serialHash -> entry
+	crl          *CRLStore
 	trustedCerts []*x509.Certificate            // доверенные сертификаты (подписанные CA)
 	ed25519Keys  map[[16]byte]ed25519.PublicKey // nodeID -> Ed25519 публичный ключ
-	crlVersion   uint32
 	diskPath     string
 }
 
@@ -48,7 +42,6 @@ type TrustStore struct {
 func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	ts := &TrustStore{
 		caPool:       x509.NewCertPool(),
-		revoked:      make(map[[16]byte]RevokedEntry),
 		trustedCerts: make([]*x509.Certificate, 0),
 		ed25519Keys:  make(map[[16]byte]ed25519.PublicKey),
 	}
@@ -73,14 +66,17 @@ func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	ts.caPool.AddCert(caCert)
 	ts.diskPath = crlPath
 
+	// CRL: подпись CA нужна только на CA-машине, но путь к ключу известен
+	// из расположения каталога.
+	dataDir := filepath.Dir(filepath.Dir(caCertPath))
+	crlStore, err := LoadCRLStore(crlPath, caCertPath, filepath.Join(dataDir, "ca", "ca-key.pem"))
+	if err != nil {
+		fmt.Printf("[TrustStore] CRL: %v\n", err)
+	}
+	ts.crl = crlStore
+
 	// Загружаем доверенные сертификаты из поддиректорий
 	ts.loadTrustedCertsFromDisk(caCertPath)
-
-	// Загружаем CRL, если существует
-	if err := ts.LoadCRL(); err != nil {
-		// CRL может не существовать при первом запуске — это нормально
-		fmt.Printf("[TrustStore] CRL не загружен: %v\n", err)
-	}
 
 	return ts, nil
 }
@@ -130,74 +126,29 @@ func (ts *TrustStore) loadTrustedCertsFromDisk(caCertPath string) {
 	}
 }
 
-// LoadCRL загружает CRL с диска.
-func (ts *TrustStore) LoadCRL() error {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	crlData, err := os.ReadFile(ts.diskPath)
-	if err != nil {
-		return err
-	}
-
-	block, _ := pem.Decode(crlData)
-	if block == nil {
-		return fmt.Errorf("не удалось декодировать PEM CRL")
-	}
-
-	entries, err := DeserializeCRL(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("десериализация CRL: %w", err)
-	}
-
-	ts.revoked = make(map[[16]byte]RevokedEntry, len(entries))
-	for _, entry := range entries {
-		ts.revoked[entry.SerialHash] = entry
-	}
-
-	ts.crlVersion++
-	return nil
-}
-
 // SaveCRL сохраняет текущий CRL на диск.
 func (ts *TrustStore) SaveCRL() error {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	return ts.saveCRLInternal()
-}
 
-// saveCRLInternal сохраняет CRL на диск без захвата мьютекса (вызывается из методов, уже владеющих lock).
-func (ts *TrustStore) saveCRLInternal() error {
-
-	entries := make([]RevokedEntry, 0, len(ts.revoked))
-	for _, entry := range ts.revoked {
-		entries = append(entries, entry)
+	if ts.crl == nil {
+		return fmt.Errorf("хранилище CRL не инициализировано")
 	}
-
-	crlData, err := SerializeCRL(entries)
-	if err != nil {
-		return err
-	}
-
-	crlPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "X509 CRL",
-		Bytes: crlData,
-	})
-
-	return os.WriteFile(ts.diskPath, crlPEM, 0644)
+	return ts.crl.Save()
 }
 
 // IsTrusted проверяет, доверяем ли мы данному сертификату.
 //
 // Проверки:
 // 1. Сертификат подписан нашим CA
-// 2. Сертификат не отозван (не в CRL)
-// 3. Сертификат ещё действителен (не просрочен)
+// 2. Его серийный номер не числится в CRL
 func (ts *TrustStore) IsTrusted(cert *x509.Certificate) bool {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 
-	// Проверка 1: подпись CA
+	// Проверка 1: подпись CA, срок действия и цепочка.
+	// cert.Verify сам проверяет NotBefore/NotAfter, поэтому отдельная
+	// проверка на протухание не нужна.
 	opts := x509.VerifyOptions{
 		Roots:     ts.caPool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
@@ -206,9 +157,8 @@ func (ts *TrustStore) IsTrusted(cert *x509.Certificate) bool {
 		return false
 	}
 
-	// Проверка 2: не отозван
-	serialHash := ComputeSerialHash(cert)
-	if _, revoked := ts.revoked[serialHash]; revoked {
+	// Проверка 2: отзыв по серийному номеру.
+	if ts.crl != nil && ts.crl.IsRevoked(cert.SerialNumber) {
 		return false
 	}
 
@@ -216,90 +166,84 @@ func (ts *TrustStore) IsTrusted(cert *x509.Certificate) bool {
 }
 
 // Revoke добавляет сертификат в CRL и сохраняет на диск.
-func (ts *TrustStore) Revoke(serialHash [16]byte, reason uint8) error {
+func (ts *TrustStore) Revoke(serial *big.Int, reason uint8) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	entry := RevokedEntry{
-		SerialHash: serialHash,
-		Reason:     reason,
+	if ts.crl == nil {
+		return fmt.Errorf("хранилище CRL не инициализировано")
 	}
-	ts.revoked[serialHash] = entry
-	ts.crlVersion++
 
-	// Сохраняем на диск немедленно — потеря CRL = потеря контроля над отзывом
-	return ts.saveCRLInternal()
+	return ts.crl.Revoke(serial, reason)
 }
 
 // IsRevokedBySerial проверяет, отозван ли сертификат с данным серийным номером.
-//
-// Мост между индексом CA (десятичная строка серийника) и CRL, который пока
-// хранит 16-байтовые хеши. После перехода CRL на crypto/x509 (фаза 1) отзывы
-// будут keyed по серийнику напрямую и этот метод станет тривиальным.
 func (ts *TrustStore) IsRevokedBySerial(serial *big.Int) bool {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 
-	serialHex := strings.ToUpper(fmt.Sprintf("%032X", serial))
-	serialBytes, err := hex.DecodeString(serialHex)
-	if err != nil || len(serialBytes) != 16 {
+	if ts.crl == nil {
 		return false
 	}
-
-	var h [16]byte
-	copy(h[:], serialBytes)
-
-	_, ok := ts.revoked[h]
-	return ok
+	return ts.crl.IsRevoked(serial)
 }
 
-// IsRevoked проверяет, отозван ли сертификат с данным хешем.
-func (ts *TrustStore) IsRevoked(serialHash [16]byte) bool {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-	_, ok := ts.revoked[serialHash]
-	return ok
+// IsRevoked проверяет, отозван ли сертификат.
+func (ts *TrustStore) IsRevoked(cert *x509.Certificate) bool {
+	return ts.IsRevokedBySerial(cert.SerialNumber)
 }
 
-// CRLVersion возвращает текущую версию CRL.
-func (ts *TrustStore) CRLVersion() uint32 {
+// CRLVersion возвращает номер текущего CRL.
+func (ts *TrustStore) CRLVersion() uint64 {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	return ts.crlVersion
+
+	if ts.crl == nil {
+		return 0
+	}
+	return ts.crl.Number()
 }
 
 // GetRevokedEntries возвращает копию всех отозванных записей.
-func (ts *TrustStore) GetRevokedEntries() []RevokedEntry {
+func (ts *TrustStore) GetRevokedEntries() []revokedCert {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 
-	entries := make([]RevokedEntry, 0, len(ts.revoked))
-	for _, entry := range ts.revoked {
-		entries = append(entries, entry)
+	if ts.crl == nil {
+		return nil
 	}
-	return entries
+	return ts.crl.Entries()
 }
 
-// MergeGossipCRL применяет CRL из gossip-пакета от другого маячка.
-// Принимаем обновления ТОЛЬКО если версия CRL отправителя новее нашей.
-func (ts *TrustStore) MergeGossipCRL(senderVersion uint32, entries []RevokedEntry) bool {
+// MergeGossipCRL применяет обновления CRL из gossip-пакета от соседа.
+//
+// Отзывы принимаются ВСЕГДА, а не только при более высокой версии отправителя.
+// Прежняя проверка `senderVersion <= localVersion` была губительной: номер CRL
+// жил только в памяти и обнулялся при каждом запуске, поэтому два свежих узла
+// имели одинаковый номер и отзывы не расходились вообще. CRL только растёт —
+// объединение безопасно и не может «отозвать обратно».
+//
+// Ограничение доверия здесь не снижается: сам пакет приходит по mTLS с
+// проверенным сертификатом пира, а подпись проверяется в handleGossip.
+func (ts *TrustStore) MergeGossipCRL(senderNumber uint64, entries []revokedCert) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	// Принимаем gossip только если у отправителя более новая версия CRL
-	if senderVersion <= ts.crlVersion {
+	if ts.crl == nil {
 		return false
 	}
 
-	// Добавляем новые записи (не удаляем — CRL только растёт)
-	for _, entry := range entries {
-		if _, exists := ts.revoked[entry.SerialHash]; !exists {
-			ts.revoked[entry.SerialHash] = entry
-		}
+	if !ts.crl.Merge(entries, senderNumber) {
+		return false
 	}
 
-	ts.crlVersion = senderVersion
-	ts.saveCRLInternal() // сохраняем немедленно (без additional lock)
+	// Сохраняем немедленно: потеря CRL означает потерю контроля над отзывом.
+	// На узле без ключа CA подписать CRL нечем — gossip-записи тогда просто
+	// не переживут перезапуск, о чём честно сообщаем.
+	if err := ts.crl.Save(); err != nil {
+		log.Printf("[TrustStore] CRL принят, но не сохранён на диск: %v", err)
+	}
+
 	return true
 }
 
@@ -359,8 +303,7 @@ func (ts *TrustStore) FindCertBySSHKey(sshPubKey ssh.PublicKey) (*x509.Certifica
 			if _, verifyErr := trustedCert.Verify(opts); verifyErr != nil {
 				return nil, fmt.Errorf("сертификат не прошёл верификацию: %w", verifyErr)
 			}
-			h := ComputeSerialHash(trustedCert)
-			if _, revoked := ts.revoked[h]; revoked {
+			if ts.crl != nil && ts.crl.IsRevoked(trustedCert.SerialNumber) {
 				return nil, fmt.Errorf("сертификат отозван")
 			}
 			return trustedCert, nil
@@ -413,6 +356,21 @@ func (ts *TrustStore) getTrustedCerts() []*x509.Certificate {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	return ts.getTrustedCertsLocked()
+}
+
+// SigningKey возвращает публичный ключ подписи узла по его NodeID.
+//
+// Ключ берётся из сертификата, а не из отдельного хранилища: это гарантирует,
+// что gossip может подписать только тот, кому CA выдал сертификат с этим ключом.
+func (ts *TrustStore) SigningKey(nodeID [16]byte) (ed25519.PublicKey, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	key, ok := ts.ed25519Keys[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("ключ подписи для узла %X не зарегистрирован", nodeID)
+	}
+	return key, nil
 }
 
 // RegisterEd25519Key регистрирует Ed25519 публичный ключ узла.
@@ -485,14 +443,44 @@ func (ts *TrustStore) RegisterEd25519KeyFromDisk(dataDir string) {
 	}
 }
 
-// VerifyHostKey — SSH HostKeyCallback, проверяющий хост-ключ через TrustStore.
+// VerifyHostKey — SSH HostKeyCallback, проверяющий host-ключ через TrustStore.
+//
+// Раньше функция заканчивалась `return nil`, то есть пропускала любой
+// host-ключ: клиент, оказавшийся посреди соединения (MITM), предъявлял свой
+// ключ и получал сессию. Сертификат узла при этом не предъявляется вовсе —
+// SSH-рукопожатие несёт только голый host-ключ.
+//
+// Проверка идёт по косвенным признакам:
+//   - host-ключ обязан совпадать с публичным ключом сертификата, выданного
+//     нашим CA;
+//   - сертификат не отозван;
+//   - сертификат не просрочен.
+//
+// Если сертификат для host-ключа не найден — соединение отклоняется. Мягкое
+// «сначала доверяем, потом проверяем» здесь означало бы, что MITM просто
+// приходит первым.
 func (ts *TrustStore) VerifyHostKey(hostname string, remote net.Addr, key ssh.PublicKey) error {
-	// Проверяем что ключ является Ed25519
-	// В P2P-сети хост-ключ — это ECDSA ключ, подписанный нашим CA.
-	// Проверяем fingerprint через доверенные сертификаты.
-	log.Printf("[SSH] проверка хост-ключа %s (адрес: %s)", hostname, remote)
-	// В P2P-сети все хосты доверены, если TCP-соединение установлено.
-	// Полная проверка происходит на уровне mTLS между маячками.
-	// SSH-хост-ключ верифицируется через CA-цепочку при первом подключении.
+	if key == nil {
+		return fmt.Errorf("SSH: пустой host-ключ")
+	}
+
+	cert, err := ts.FindCertBySSHKey(key)
+	if err != nil {
+		return fmt.Errorf("SSH host-ключ не принадлежит ни одному доверенному узлу "+
+			"(addr=%s, fingerprint=%s): %w", remote, ssh.FingerprintSHA256(key), err)
+	}
+
+	if ts.crl != nil && ts.crl.IsRevoked(cert.SerialNumber) {
+		return fmt.Errorf("SSH: сертификат узла %s отозван", cert.Subject.CommonName)
+	}
+
+	if time.Now().After(cert.NotAfter) {
+		return fmt.Errorf("SSH: сертификат узла %s просрочен (%s)",
+			cert.Subject.CommonName, cert.NotAfter.Format("2006-01-02"))
+	}
+
+	log.Printf("[SSH] host-ключ принят: CN=%s fingerprint=%s addr=%s",
+		cert.Subject.CommonName, ssh.FingerprintSHA256(key), remote)
+
 	return nil
 }

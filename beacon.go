@@ -345,6 +345,12 @@ func (b *BeaconNode) connectToPeer(peer *DiscoveredPeer) {
 		return
 	}
 
+	// Ключ подписи регистрируется именно здесь — после успешного mTLS.
+	// Это и есть TOFU-биндинг: ключ берётся из сертификата, проверенного по
+	// CA и CRL, а не из присланного пакета. Поэтому gossip от этого узла
+	// можно проверять, а подделать подпись нельзя.
+	b.registerPeerSigningKey(peerNodeID, peerCert)
+
 	b.mu.Lock()
 	if existing, ok := b.peers[peerNodeID]; ok {
 		// Уже есть запись для этого узла — обновляем адрес, не плодим дубликат.
@@ -367,6 +373,28 @@ func (b *BeaconNode) connectToPeer(peer *DiscoveredPeer) {
 	b.handlePeerConnection(peer, conn)
 }
 
+// pushGossip отправляет накопленный CRL пиру по установленному соединению.
+//
+// Работает в обе стороны: и когда мы подключаемся к пиру, и когда пир
+// подключается к нам. Иначе gossip был бы односторонним — пир, который сам
+// инициировал соединение, наши отзывы так и не узнал бы, а узнать их мог бы
+// только ждать 30-минутного цикла.
+func (b *BeaconNode) pushGossip(conn *tls.Conn, reason string) {
+	entries := b.trustStore.GetRevokedEntries()
+	if len(entries) == 0 {
+		return
+	}
+
+	if err := b.sendGossipToConn(conn, entries); err != nil {
+		log.Printf("[Beacon] не удалось отправить gossip (%s) на %s: %v",
+			reason, conn.RemoteAddr(), err)
+		return
+	}
+
+	log.Printf("[Beacon] отправлен gossip (%s) на %s: CRL #%d, записей %d",
+		reason, conn.RemoteAddr(), b.trustStore.CRLVersion(), len(entries))
+}
+
 // handlePeerConnection обрабатывает активное TLS-соединение с пиром.
 func (b *BeaconNode) handlePeerConnection(peer *DiscoveredPeer, conn *tls.Conn) {
 	defer func() {
@@ -378,11 +406,7 @@ func (b *BeaconNode) handlePeerConnection(peer *DiscoveredPeer, conn *tls.Conn) 
 		log.Printf("[Beacon] соединение с %s разорвано", peer.Addr)
 	}()
 
-	// Отправляем gossip при первом подключении
-	entries := b.trustStore.GetRevokedEntries()
-	if len(entries) > 0 {
-		b.sendGossipToConn(conn, entries)
-	}
+	b.pushGossip(conn, "исходящее")
 
 	buf := make([]byte, MaxPacketSize)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -403,12 +427,18 @@ func (b *BeaconNode) handlePeerConnection(peer *DiscoveredPeer, conn *tls.Conn) 
 			return
 		}
 
-		b.handlePeerMessage(buf[:numBytes], peer)
+		b.handlePeerMessage(buf[:numBytes], peer, buf[:numBytes])
 	}
 }
 
 // handlePeerMessage обрабатывает сообщение от пира по TLS.
-func (b *BeaconNode) handlePeerMessage(data []byte, peer *DiscoveredPeer) {
+//
+// Сообщение приходит по mTLS, поэтому отправитель уже аутентифицирован
+// сертификатом, подписанным нашим CA. Дополнительно проверяется подпись
+// gossip-пакета ключом отправителя: mTLS гарантирует, что канал открыт именно
+// с ним, но не гарантирует, что приложенные данные не подделаны другим
+// участником того же туннеля.
+func (b *BeaconNode) handlePeerMessage(data []byte, peer *DiscoveredPeer, fullPkt []byte) {
 	if len(data) < MinPacketSize {
 		return
 	}
@@ -421,15 +451,27 @@ func (b *BeaconNode) handlePeerMessage(data []byte, peer *DiscoveredPeer) {
 
 	switch pkt.Type {
 	case PktGossip:
-		b.handleGossip(pkt, peer)
+		b.handleGossip(pkt, peer, fullPkt)
 	default:
 		log.Printf("[Beacon] неизвестный тип сообщения: %d", pkt.Type)
 	}
 }
 
 // handleGossip обрабатывает gossip-обновление CRL.
-func (b *BeaconNode) handleGossip(pkt *DiscoveryPacket, peer *DiscoveredPeer) {
+//
+// Три независимые проверки перед применением:
+//  1. подпись пакета ключом Ed25519 отправителя;
+//  2. NodeID в пакете совпадает с идентификатором, выведенным из ключа;
+//  3. NodeID совпадает с сертификатом пира, по которому установлен mTLS —
+//     именно это связывает gossip с тем, кто предъявил сертификат, и не даёт
+//     перехватившему mTLS-канал подсунуть свои отзывы.
+func (b *BeaconNode) handleGossip(pkt *DiscoveryPacket, peer *DiscoveredPeer, fullPkt []byte) {
 	if len(pkt.Payload) == 0 {
+		return
+	}
+
+	if err := b.verifyGossipSignature(pkt, peer, fullPkt); err != nil {
+		log.Printf("[Beacon] gossip от %s отклонён: %v", peer.Addr, err)
 		return
 	}
 
@@ -439,10 +481,44 @@ func (b *BeaconNode) handleGossip(pkt *DiscoveryPacket, peer *DiscoveredPeer) {
 		return
 	}
 
-	if b.trustStore.MergeGossipCRL(gossip.CRLVersion, gossip.RevokedEntries) {
-		log.Printf("[Beacon] Trust Store обновлен через gossip от %s (версия CRL: %d, новых записей: %d)",
-			peer.Addr, gossip.CRLVersion, len(gossip.RevokedEntries))
+	if b.trustStore.MergeGossipCRL(gossip.Number, gossip.RevokedEntries) {
+		log.Printf("[Beacon] Trust Store обновлён через gossip от %s (CRL #%d, записей: %d)",
+			peer.Addr, gossip.Number, len(gossip.RevokedEntries))
 	}
+}
+
+// verifyGossipSignature проверяет подпись gossip-пакета и соответствие
+// отправителя пиру, по которому открыт mTLS-канал.
+func (b *BeaconNode) verifyGossipSignature(pkt *DiscoveryPacket, peer *DiscoveredPeer, fullPkt []byte) error {
+	if peer == nil {
+		return fmt.Errorf("нет контекста пира")
+	}
+
+	if len(fullPkt) < MinPacketSize {
+		return fmt.Errorf("пакет слишком короткий для проверки подписи: %d байт", len(fullPkt))
+	}
+
+	// Ключ отправителя известен из его сертификата — того самого, по которому
+	// прошло mTLS-рукопожатие.
+	pub, err := b.trustStore.SigningKey(pkt.NodeID)
+	if err != nil {
+		return fmt.Errorf("ключ подписи отправителя: %w", err)
+	}
+
+	sigData := fullPkt[:len(fullPkt)-SignatureSize]
+	signature := fullPkt[len(fullPkt)-SignatureSize:]
+
+	if !ed25519.Verify(pub, sigData, signature) {
+		return fmt.Errorf("подпись Ed25519 неверна")
+	}
+
+	// Отправитель gossip обязан быть тем же, кто открыл TLS-соединение.
+	if peer.NodeID != pkt.NodeID {
+		return fmt.Errorf("NodeID пакета %X не совпадает с пиром mTLS %X",
+			pkt.NodeID, peer.NodeID)
+	}
+
+	return nil
 }
 
 // tlsServerLoop принимает TLS-соединения от других маячков.
@@ -515,7 +591,41 @@ func (b *BeaconNode) handleIncomingTLS(conn *tls.Conn) {
 	log.Printf("[Beacon] принято TLS-соединение от %s (CN=%s)",
 		conn.RemoteAddr(), peerCert.Subject.CommonName)
 
+	// Ключ подписи входящего пира тоже нужно зарегистрировать: без этого
+	// его gossip нельзя будет проверить. Аутентификация уже прошла выше.
+	if peerNodeID, err := NodeIDFromCert(peerCert); err == nil {
+		b.registerPeerSigningKey(peerNodeID, peerCert)
+	} else {
+		log.Printf("[Beacon] входящий пир %s без ключа подписи: %v",
+			peerCert.Subject.CommonName, err)
+	}
+
 	go b.handleIncomingConnection(conn, peerCert)
+}
+
+// registerPeerSigningKey регистрирует ключ подписи узла после успешной
+// аутентификации по mTLS.
+//
+// Ключ берётся из SAN сертификата, который к этому моменту уже прошёл
+// проверку подписи CA и CRL. Отдельная проверка nodeID == f(ключ) обязательна:
+// иначе злоумышленник с валидным сертификатом одного узла зарегистрировал бы
+// себя под чужим NodeID и подписывал бы gossip от его имени.
+func (b *BeaconNode) registerPeerSigningKey(nodeID [16]byte, peerCert *x509.Certificate) {
+	pub, err := Ed25519PubFromCert(peerCert)
+	if err != nil {
+		log.Printf("[Beacon] ключ подписи не извлечён у %s: %v", peerCert.Subject.CommonName, err)
+		return
+	}
+
+	if got := NodeIDFromEd25519Pub(pub); got != nodeID {
+		log.Printf("[Beacon] ВНИМАНИЕ: ключ из сертификата %s даёт nodeID %X, ожидался %X — "+
+			"узел не зарегистрирован", peerCert.Subject.CommonName, got, nodeID)
+		return
+	}
+
+	b.trustStore.RegisterEd25519Key(nodeID, pub)
+	log.Printf("[Beacon] ключ подписи узла %s зарегистрирован (nodeID=%X)",
+		peerCert.Subject.CommonName, nodeID)
 }
 
 // handleIncomingConnection обрабатывает данные от подключившегося пира.
@@ -551,6 +661,10 @@ func (b *BeaconNode) handleIncomingConnection(conn *tls.Conn, peerCert *x509.Cer
 	}
 	b.mu.Unlock()
 
+	// Отзывы уходят и на входящее соединение: пир, подключившийся к нам
+	// сам, должен узнать о них сразу, а не через 30-минутный цикл.
+	b.pushGossip(conn, "входящее")
+
 	buf := make([]byte, MaxPacketSize)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
@@ -566,17 +680,22 @@ func (b *BeaconNode) handleIncomingConnection(conn *tls.Conn, peerCert *x509.Cer
 			return
 		}
 
-		b.handlePeerMessage(buf[:numBytes], peer)
+		b.handlePeerMessage(buf[:numBytes], peer, buf[:numBytes])
 	}
 }
 
-// sendGossipToConn отправляет CRL-гossip через TLS-соединение.
-func (b *BeaconNode) sendGossipToConn(conn *tls.Conn, entries []RevokedEntry) {
+// sendGossipToConn отправляет CRL-gossip через TLS-соединение.
+func (b *BeaconNode) sendGossipToConn(conn *tls.Conn, entries []revokedCert) error {
 	gossipPayload := &GossipPayload{
-		CRLVersion:     b.trustStore.CRLVersion(),
+		Number:         b.trustStore.CRLVersion(),
 		RevokedEntries: entries,
 	}
-	payload, _ := SerializeGossipPayload(gossipPayload)
+
+	payload, err := SerializeGossipPayload(gossipPayload)
+	if err != nil {
+		return fmt.Errorf("сериализация gossip: %w", err)
+	}
+
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
 		Version:   ProtocolVersion,
@@ -585,13 +704,16 @@ func (b *BeaconNode) sendGossipToConn(conn *tls.Conn, entries []RevokedEntry) {
 		Timestamp: time.Now().Unix(),
 		Payload:   payload,
 	}
+
 	if _, err := rand.Read(pkt.Nonce[:]); err != nil {
-		return
+		return fmt.Errorf("генерация nonce: %w", err)
 	}
-	dataToSign := pkt.Serialize()
-	sig := ed25519.Sign(b.edPriv, dataToSign)
-	fullPacket := append(dataToSign, sig...)
-	conn.Write(fullPacket)
+
+	if _, err := conn.Write(SignPacket(pkt, b.edPriv)); err != nil {
+		return fmt.Errorf("запись gossip: %w", err)
+	}
+
+	return nil
 }
 
 // gossipLoop периодически рассылает CRL всем подключённым пиром.
@@ -621,7 +743,9 @@ func (b *BeaconNode) gossipLoop() {
 			}
 
 			for _, peer := range activePeers {
-				b.sendGossipToConn(peer.TLSConn, entries)
+				if err := b.sendGossipToConn(peer.TLSConn, entries); err != nil {
+					log.Printf("[Beacon] gossip на %s не отправлен: %v", peer.Addr, err)
+				}
 			}
 		}
 	}

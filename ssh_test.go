@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
@@ -21,11 +22,13 @@ func testCA(t *testing.T) (*ecdsa.PrivateKey, *x509.Certificate, *x509.CertPool)
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	template := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "Test CA"},
-		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign,
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "Test CA"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		// CRLSign обязателен: без него x509.CreateRevocationList отказывается
+		// подписывать CRL, и тесты отзыва были бы невозможны.
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
@@ -73,17 +76,25 @@ func testCertSetup(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certifica
 
 	// Создаём TrustStore с CA и доверенным сертификатом маячка
 	beaconCert, _ := x509.ParseCertificate(certDER)
+
 	ts := &TrustStore{
 		caPool:       x509.NewCertPool(),
 		caCert:       caCert,
-		revoked:      make(map[[16]byte]RevokedEntry),
 		trustedCerts: []*x509.Certificate{beaconCert},
+		ed25519Keys:  make(map[[16]byte]ed25519.PublicKey),
+		crl: &CRLStore{
+			revoked:  make(map[string]revokedCert),
+			diskPath: dir + "/ca/crl.pem",
+			caCert:   caCert,
+			caKey:    caKey,
+		},
 	}
 	ts.caPool.AddCert(caCert)
 
 	if revoke {
-		h := ComputeSerialHash(beaconCert)
-		ts.Revoke(h, 1)
+		if err := ts.Revoke(beaconCert.SerialNumber, 1); err != nil {
+			t.Fatalf("отзыв: %v", err)
+		}
 	}
 
 	cfg := &Config{
@@ -207,9 +218,14 @@ func TestSSHSelfSignedCert(t *testing.T) {
 	os.WriteFile(dir+"/ca/ca-cert.pem", caCertPEM, 0644)
 
 	ts := &TrustStore{
-		caPool:  x509.NewCertPool(),
-		caCert:  caCert,
-		revoked: make(map[[16]byte]RevokedEntry),
+		caPool:      x509.NewCertPool(),
+		caCert:      caCert,
+		ed25519Keys: make(map[[16]byte]ed25519.PublicKey),
+		crl: &CRLStore{
+			revoked:  make(map[string]revokedCert),
+			diskPath: dir + "/ca/crl.pem",
+			caCert:   caCert,
+		},
 	}
 	ts.caPool.AddCert(caCert)
 

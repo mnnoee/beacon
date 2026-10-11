@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -411,57 +410,36 @@ func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue
 
 // cmdRevokeBeacon отзывает сертификат маячка.
 //
-// Принимает либо серийный номер сертификата (десятичная строка из
-// `ca list-trusted` — рекомендуемый способ), либо legacy-хеш из 32 hex-символов.
-//
-// Сейчас CRL хранит не серийники, а хеш от CN (ComputeSerialHash), поэтому
-// серийник сначала резолвится в сертификат на диске, а уже от него берётся
-// хеш. Переход CRL на настоящие серийники — фаза 1, тогда резолвинг исчезнет.
+// Принимает серийный номер сертификата — десятичную строку из
+// `ca list-trusted`. Это и есть ключ отзыва: уникальный на каждую выдачу,
+// поэтому отзыв пере-выданного сертификата не задевает свежий.
 func cmdRevokeBeacon(dataDir, serialArg string) {
-	serialHash, err := resolveRevocationTarget(dataDir, serialArg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ошибка отзыва: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := RevokeCertificate(dataDir, serialHash, 1); err != nil {
-		fmt.Fprintf(os.Stderr, "ошибка отзыва: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Сертификат %s отозван (CRL-ключ %X).\n", serialArg, serialHash)
-	fmt.Println("CRL обновлён. Маячки получат обновление через gossip-протокол.")
-}
-
-// resolveRevocationTarget приводит аргумент команды отзыва к 16-байтовому
-// ключу записи CRL.
-func resolveRevocationTarget(dataDir, arg string) ([16]byte, error) {
-	arg = strings.TrimSpace(arg)
-
-	// Legacy-путь: 32 hex-символа — готовый хеш.
-	if len(arg) == 32 {
-		raw, err := hex.DecodeString(arg)
-		if err == nil {
-			var h [16]byte
-			copy(h[:], raw)
-			return h, nil
-		}
-	}
-
-	// Основной путь: десятичный серийный номер. Ищем сертификат с таким
-	// серийником среди выпущенных и берём его CRL-ключ.
-	serial, ok := new(big.Int).SetString(arg, 10)
+	serial, ok := new(big.Int).SetString(strings.TrimSpace(serialArg), 10)
 	if !ok {
-		return [16]byte{}, fmt.Errorf("аргумент '%s' не является ни серийным номером, ни 32-hex хешем", arg)
+		fmt.Fprintf(os.Stderr, "'%s' не является серийным номером сертификата\n", serialArg)
+		fmt.Fprintln(os.Stderr, "номер выводит команда 'beacon ca list-trusted'")
+		os.Exit(1)
 	}
 
-	cert, err := findCertBySerial(dataDir, serial)
-	if err != nil {
-		return [16]byte{}, err
+	// Показываем, кому принадлежит сертификат: отзыв по номеру вслепую —
+	// плохая идея.
+	if cert, err := findCertBySerial(dataDir, serial); err == nil {
+		fmt.Printf("Отзыв сертификата CN=%s\n", cert.Subject.CommonName)
+		if !cert.NotAfter.IsZero() {
+			fmt.Printf("  действует до: %s\n", cert.NotAfter.Format("2006-01-02"))
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "сертификат %s не найден на диске: %v\n", serial, err)
+		fmt.Fprintln(os.Stderr, "продолжаю отзыв по номеру — проверьте номер по 'ca list-trusted'")
 	}
 
-	fmt.Printf("Найден сертификат CN=%s\n", cert.Subject.CommonName)
-	return ComputeSerialHash(cert), nil
+	if err := RevokeCertificate(dataDir, serial, 1); err != nil {
+		fmt.Fprintf(os.Stderr, "ошибка отзыва: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Сертификат %s отозван. CRL подписан ключом CA и обновлён.\n", serial)
+	fmt.Println("Маячки получат обновление через gossip-протокол.")
 }
 
 // findCertBySerial ищет выпущенный сертификат по серийному номеру.
@@ -567,9 +545,10 @@ func cmdListTrusted(dataDir string) {
 	}
 
 	entries := ts.GetRevokedEntries()
-	fmt.Printf("\nCRL: версия %d, отозвано %d сертификатов\n", ts.CRLVersion(), len(entries))
+	fmt.Printf("\nCRL: номер %d, отозвано %d сертификатов\n", ts.CRLVersion(), len(entries))
 	for _, entry := range entries {
-		fmt.Printf("  - %X (причина: %d)\n", entry.SerialHash, entry.Reason)
+		fmt.Printf("  - %s (причина: %d, отозван: %s)\n",
+			entry.SerialNumber, entry.Reason, entry.RevokedAt.Format("2006-01-02"))
 	}
 }
 
