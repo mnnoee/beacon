@@ -18,12 +18,12 @@ import (
 // - UDP spoofing flood (один IP отправляет тысячи пакетов в секунду)
 // - Broadcast storms (узел генерирует чрезмерный трафик обнаружения)
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*tokenBucket
-	rate     float64 // токенов в секунду
-	burst    int     // максимальный размер бакета
-	cleanup  time.Duration
-	stopCh   chan struct{}
+	mu      sync.Mutex
+	buckets map[string]*tokenBucket
+	rate    float64 // токенов в секунду
+	burst   int     // максимальный размер бакета
+	cleanup time.Duration
+	stopCh  chan struct{}
 }
 
 type tokenBucket struct {

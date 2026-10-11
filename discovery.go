@@ -23,20 +23,21 @@ const NonceTTL = 300 * time.Second
 type Discovery struct {
 	mu sync.Mutex
 
-	nodeID    [16]byte
-	privKey   ed25519.PrivateKey
-	pubKey    ed25519.PublicKey
+	nodeID  [16]byte
+	privKey ed25519.PrivateKey
+	pubKey  ed25519.PublicKey
 
 	port        int
 	mcastAddr   string // multicast-адрес (попытка №1)
 	broadcastIP string // broadcast-адрес (fallback)
 	bindAddr    string
 
-	conn     *net.UDPConn
-	limiter  *RateLimiter
-	callback DiscoveryCallback
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	conn       *net.UDPConn
+	limiter    *RateLimiter
+	trustStore *TrustStore
+	callback   DiscoveryCallback
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
 
 	// Режим работы: true = multicast, false = broadcast
 	useMulticast bool
@@ -62,6 +63,15 @@ func NewDiscovery(nodeID [16]byte, privKey ed25519.PrivateKey, port int, mcastAd
 		sentNonces:   make(map[[32]byte]time.Time),
 		useMulticast: true, // начнём с multicast, fallback на broadcast
 	}
+}
+
+// SetTrustStore подключает TrustStore для проверки сертификатов объявившихся
+// узлов. Без него подпись проверяется только на согласованность с NodeID,
+// но не сверяется с сертификатом — это недостаточно для защиты от подмены.
+func (d *Discovery) SetTrustStore(ts *TrustStore) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.trustStore = ts
 }
 
 // OnDiscover устанавливает callback.
@@ -114,7 +124,6 @@ func (d *Discovery) Start() error {
 	d.wg.Add(1)
 	go d.nonceCleanupLoop()
 
-	return nil
 	return nil
 }
 
@@ -172,21 +181,25 @@ func (d *Discovery) broadcastLoop() {
 // sendAnnounce создаёт и отправляет PktAnnounce.
 // Использует multicast или broadcast в зависимости от режима.
 func (d *Discovery) sendAnnounce() error {
+	payload, err := (&AnnouncePayload{Ed25519Pub: d.pubKey}).Serialize()
+	if err != nil {
+		return fmt.Errorf("формирование announce payload: %w", err)
+	}
+
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
 		Version:   ProtocolVersion,
 		Type:      PktAnnounce,
 		NodeID:    d.nodeID,
 		Timestamp: time.Now().Unix(),
+		Payload:   payload,
 	}
 
 	if _, err := rand.Read(pkt.Nonce[:]); err != nil {
 		return fmt.Errorf("генерация nonce: %w", err)
 	}
 
-	dataToSign := pkt.Serialize()
-	pktSig := ed25519.Sign(d.privKey, dataToSign)
-	fullPacket := append(dataToSign, pktSig...)
+	fullPacket := SignPacket(pkt, d.privKey)
 
 	// Выбираем адрес: multicast или broadcast
 	targetIP := d.mcastAddr
@@ -199,7 +212,7 @@ func (d *Discovery) sendAnnounce() error {
 		Port: d.port,
 	}
 
-	_, err := d.conn.WriteToUDP(fullPacket, destAddr)
+	_, err = d.conn.WriteToUDP(fullPacket, destAddr)
 	if err != nil {
 		// Fallback: если multicast не удался, пробуем broadcast
 		if d.useMulticast {
@@ -218,6 +231,16 @@ func (d *Discovery) sendAnnounce() error {
 	d.mu.Unlock()
 
 	return nil
+}
+
+// SignPacket подписывает пакет Ed25519-ключом и склеивает с подписью.
+//
+// Вынесено отдельно, чтобы отправка и проверка считали подпись от одних и тех
+// же байтов: иначе пакет, подписанный иначе, будет принят как валидный.
+func SignPacket(pkt *DiscoveryPacket, priv ed25519.PrivateKey) []byte {
+	dataToSign := pkt.Serialize()
+	sig := ed25519.Sign(priv, dataToSign)
+	return append(dataToSign, sig...)
 }
 
 // receiveLoop читает UDP-пакеты и обрабатывает их.
@@ -285,15 +308,15 @@ func (d *Discovery) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 		return
 	}
 
-	// Проверяем Ed25519-подпись пакета
-	if len(data) >= PacketHeaderSize+SignatureSize {
-		sigData := data[:len(data)-SignatureSize]
-		signature := data[len(data)-SignatureSize:]
-		// Подпись проверяется, но публичный ключ отправителя нам неизвестен.
-		// Мы доверяем discovery-пакетам как "анонсам" — реальная верификация
-		// происходит на этапе TLS/SSH. Подпись доказывает владение приватным ключом.
-		_ = sigData
-		_ = signature
+	// Проверяем Ed25519-подпись пакета.
+	//
+	// Ключ берём из payload самого пакета, но это ничего не доказывает само по
+	// себе — иначе подделка была бы тривиальной. Смысл в том, что ключ из
+	// payload обязан совпасть с ключом, указанным в сертификате узла, а
+	// сертификат подписан нашим CA. Подробнее — в verifyPacketSignature.
+	if err := d.verifyPacketSignature(pkt, data); err != nil {
+		log.Printf("[Discovery] подпись пакета от %s не принята: %v", remoteAddr, err)
+		return
 	}
 
 	d.mu.Lock()
@@ -309,9 +332,81 @@ func (d *Discovery) handlePacket(data []byte, remoteAddr *net.UDPAddr) {
 	}
 }
 
+// verifyPacketSignature проверяет подпись пакета и соответствие объявленного
+// NodeID ключу из сертификата.
+//
+// Две независимые проверки:
+//
+//  1. Подпись самим пакетом — доказывает, что отправитель владеет приватным
+//     ключом, соответствующим ключу из payload.
+//  2. NodeID == SHA-256(payload-ключ)[:16] и совпадение payload-ключа с SAN
+//     сертификата — доказывает, что этот ключ выпущен нашим CA под тем именем,
+//     которым узел представляется.
+//
+// Вторая проверка и есть защита от спуфинга: атакующий может подписать пакет
+// своим собственным ключом, но подставить чужой NodeID или чужой CN он не может,
+// потому что SAN сертификата подписан CA.
+func (d *Discovery) verifyPacketSignature(pkt *DiscoveryPacket, data []byte) error {
+	// Пакеты gossip идут по mTLS и подписываются там же; UDP-подпись для них
+	// не проверяется. Их обработчик принимает только уже аутентифицированное
+	// соединение.
+	if pkt.Type == PktGossip {
+		return nil
+	}
+
+	if len(data) < PacketHeaderSize+SignatureSize {
+		return fmt.Errorf("пакет слишком короткий для подписи: %d байт", len(data))
+	}
+
+	payload, err := DeserializeAnnouncePayload(pkt.Payload)
+	if err != nil {
+		return fmt.Errorf("payload announce: %w", err)
+	}
+
+	sigData := data[:len(data)-SignatureSize]
+	signature := data[len(data)-SignatureSize:]
+
+	if !ed25519.Verify(payload.Ed25519Pub, sigData, signature) {
+		return fmt.Errorf("подпись Ed25519 неверна")
+	}
+
+	// NodeID обязан соответствовать ключу, которым подписан пакет.
+	if got := NodeIDFromEd25519Pub(payload.Ed25519Pub); got != pkt.NodeID {
+		return fmt.Errorf("NodeID %X не соответствует ключу из payload (%X)", pkt.NodeID, got)
+	}
+
+	// Ключ обязан совпадать с ключом в сертификате узла, если тот известен.
+	// Неизвестные узлы отбрасываются: иначе кто угодно рассылает announce с
+	// ключом, на который нет сертификата.
+	if d.trustStore != nil {
+		cert, err := d.trustStore.FindCertByNodeID(pkt.NodeID)
+		if err != nil {
+			return fmt.Errorf("узел не известен TrustStore: %w", err)
+		}
+
+		certPub, err := Ed25519PubFromCert(cert)
+		if err != nil {
+			return fmt.Errorf("ключ в сертификате: %w", err)
+		}
+
+		if !certPub.Equal(payload.Ed25519Pub) {
+			return fmt.Errorf("ключ пакета не совпадает с ключом сертификата CN=%s",
+				cert.Subject.CommonName)
+		}
+	}
+
+	return nil
+}
+
 // sendEcho отправляет PktEcho в ответ на Announce.
 func (d *Discovery) sendEcho(targetID [16]byte, targetAddr *net.UDPAddr) {
 	_ = targetID
+
+	payload, err := (&AnnouncePayload{Ed25519Pub: d.pubKey}).Serialize()
+	if err != nil {
+		log.Printf("[Discovery] формирование echo payload: %v", err)
+		return
+	}
 
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
@@ -319,6 +414,7 @@ func (d *Discovery) sendEcho(targetID [16]byte, targetAddr *net.UDPAddr) {
 		Type:      PktEcho,
 		NodeID:    d.nodeID,
 		Timestamp: time.Now().Unix(),
+		Payload:   payload,
 	}
 
 	if _, err := rand.Read(pkt.Nonce[:]); err != nil {
@@ -326,12 +422,7 @@ func (d *Discovery) sendEcho(targetID [16]byte, targetAddr *net.UDPAddr) {
 		return
 	}
 
-	dataToSign := pkt.Serialize()
-	pktSig := ed25519.Sign(d.privKey, dataToSign)
-	fullPacket := append(dataToSign, pktSig...)
-
-	_, err := d.conn.WriteToUDP(fullPacket, targetAddr)
-	if err != nil {
+	if _, err := d.conn.WriteToUDP(SignPacket(pkt, d.privKey), targetAddr); err != nil {
 		log.Printf("[Discovery] отправка echo: %v", err)
 	}
 }
@@ -375,6 +466,9 @@ func (d *Discovery) nonceCleanupLoop() {
 }
 
 // SendGossip отправляет gossip-пакет конкретному узлу (unicast по UDP).
+//
+// Пакет подписывается, но получатель не проверяет подпись: gossip принимается
+// только по уже установленному mTLS-соединению (см. BeaconNode.handleGossip).
 func (d *Discovery) SendGossip(targetAddr *net.UDPAddr, crlVersion uint32, entries []RevokedEntry) error {
 	gossipPayload := &GossipPayload{
 		CRLVersion:     crlVersion,
@@ -399,10 +493,6 @@ func (d *Discovery) SendGossip(targetAddr *net.UDPAddr, crlVersion uint32, entri
 		return fmt.Errorf("генерация nonce: %w", err)
 	}
 
-	dataToSign := pkt.Serialize()
-	pktSig := ed25519.Sign(d.privKey, dataToSign)
-	fullPacket := append(dataToSign, pktSig...)
-
-	_, err = d.conn.WriteToUDP(fullPacket, targetAddr)
+	_, err = d.conn.WriteToUDP(SignPacket(pkt, d.privKey), targetAddr)
 	return err
 }

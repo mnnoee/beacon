@@ -40,9 +40,9 @@ type BeaconNode struct {
 
 	config *Config
 
-	nodeID   [16]byte
-	edPriv   ed25519.PrivateKey
-	edPub    ed25519.PublicKey
+	nodeID [16]byte
+	edPriv ed25519.PrivateKey
+	edPub  ed25519.PublicKey
 
 	tlsServerConfig *tls.Config
 	tlsClientConfig *tls.Config
@@ -84,54 +84,75 @@ func NewBeaconNode(cfg *Config) (*BeaconNode, error) {
 	return node, nil
 }
 
-// loadOrCreateEdKey загружает Ed25519-ключ или генерирует новый.
+// loadOrCreateEdKey загружает Ed25519-ключ узла.
+//
+// Ключ больше НЕ создаётся автоматически при первом запуске. Раньше здесь была
+// генерация ключа на лету, из-за чего появлялись две несовместимые системы
+// идентичности: узел без сертификата получал собственный NodeID и слал
+// announce с ключом, которого нет ни в одном сертификате. Теперь ключ выдаётся
+// вместе с сертификатом (provision-beacon) и лежит в его SAN, поэтому
+// отсутствие файла — это ошибка конфигурации с понятным текстом.
 func (b *BeaconNode) loadOrCreateEdKey() error {
-	keyPath := b.config.DataDir + "/" + b.config.NodeName + "/ed25519-key.pem"
+	keyPath := b.config.Ed25519KeyPath()
 
 	data, err := ReadFileContents(keyPath)
 	if err != nil {
 		return fmt.Errorf("чтение Ed25519 ключа: %w", err)
 	}
 
-	if data != nil {
-		block, _ := pem.Decode(data)
-		if block == nil {
-			return fmt.Errorf("невалидный PEM Ed25519 ключа")
-		}
-		priv, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return fmt.Errorf("парсинг Ed25519 ключа: %w", err)
-		}
-		edKey, ok := priv.(ed25519.PrivateKey)
-		if !ok {
-			return fmt.Errorf("ключ не Ed25519")
-		}
-		b.edPriv = edKey
-		b.edPub = edKey.Public().(ed25519.PublicKey)
-		b.nodeID = [16]byte(b.edPub[:16])
+	if data == nil {
+		return fmt.Errorf("не найден Ed25519-ключ %s: выдайте сертификат заново командой "+
+			"'beacon ca provision-beacon -reissue %s' — ключ выдаётся вместе с сертификатом, "+
+			"а его публичная часть записывается в SAN", keyPath, b.config.NodeName)
+	}
+
+	edKey, err := DeserializePrivateKeyPEM(data)
+	if err != nil {
+		return fmt.Errorf("разбор Ed25519 ключа %s: %w", keyPath, err)
+	}
+
+	b.edPriv = edKey
+	b.edPub = edKey.Public().(ed25519.PublicKey)
+
+	// NodeID выводится из ключа детерминированно — так его вычислит и сосед,
+	// получив ключ из нашего сертификата.
+	b.nodeID = NodeIDFromEd25519Pub(b.edPub)
+
+	// Сверяем ключ с сертификатом: подпись discovery имеет смысл только если
+	// сосед сможет найти этот ключ в нашем сертификате.
+	_, certPath, _ := b.config.BeaconPaths()
+	certData, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("чтение сертификата для сверки ключа: %w", err)
+	}
+
+	block, _ := pem.Decode(certData)
+	if block == nil {
+		return fmt.Errorf("невалидный PEM сертификата в %s", certPath)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("парсинг сертификата: %w", err)
+	}
+
+	certPub, err := Ed25519PubFromCert(cert)
+	if err != nil {
+		// Сертификат старого формата. Не прерываем запуск: узел должен иметь
+		// возможность подняться, чтобы получить новый сертификат. Но в сеть
+		// он не попадёт — соседи отвергнут его announce.
+		log.Printf("[Beacon] ВНИМАНИЕ: %v", err)
+		log.Printf("[Beacon] на CA-машине выполните 'beacon ca provision-beacon -reissue %s' "+
+			"и разложите новые файлы в %s", b.config.NodeName, b.config.DataDir)
 		return nil
 	}
 
-	pub, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		return fmt.Errorf("генерация Ed25519 ключа: %w", err)
-	}
-	b.edPriv = priv
-	b.edPub = pub
-
-	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return fmt.Errorf("маршализация ключа: %w", err)
-	}
-	privPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: privDER,
-	})
-	if err := SaveKeyToFile(keyPath, privPEM); err != nil {
-		return fmt.Errorf("сохранение Ed25519 ключа: %w", err)
+	if !certPub.Equal(b.edPub) {
+		return fmt.Errorf("Ed25519-ключ %s не совпадает с ключом в сертификате %s: "+
+			"подписи discovery не будут соответствовать сертификату, соседи отвергнут узел",
+			keyPath, certPath)
 	}
 
-	b.nodeID = [16]byte(pub[:16])
 	return nil
 }
 
@@ -191,14 +212,18 @@ func (b *BeaconNode) Start() error {
 	b.discovery = NewDiscovery(
 		b.nodeID, b.edPriv,
 		b.config.DiscoveryPort,
-		"239.19.84.1",           // multicast (попытка №1)
-		b.config.BroadcastAddr,  // broadcast (основной режим)
+		"239.19.84.1",          // multicast (попытка №1)
+		b.config.BroadcastAddr, // broadcast (основной режим)
 		b.config.BindAddr,
 		limiter,
 	)
 	// Начинаем с broadcast — multicast не работает через WiFi-роутеры
 	b.discovery.useMulticast = false
 
+	// Discovery проверяет сертификаты объявившихся узлов: без TrustStore
+	// подпись пакета проверяется только на согласованность с NodeID, что не
+	// защищает от подмены.
+	b.discovery.SetTrustStore(b.trustStore)
 	b.discovery.OnDiscover(b.onPeerDiscovered)
 
 	if err := b.discovery.Start(); err != nil {
@@ -310,13 +335,34 @@ func (b *BeaconNode) connectToPeer(peer *DiscoveredPeer) {
 		return
 	}
 
+	// Идентичность пира выводится из его сертификата, а не из SubjectKeyId.
+	// Это гарантирует, что discovery-NodeID и NodeID, полученные по TLS,
+	// указывают на один и тот же узел.
+	peerNodeID, err := NodeIDFromCert(peerCert)
+	if err != nil {
+		log.Printf("[Beacon] пир %s: %v", addr, err)
+		conn.Close()
+		return
+	}
+
 	b.mu.Lock()
+	if existing, ok := b.peers[peerNodeID]; ok {
+		// Уже есть запись для этого узла — обновляем адрес, не плодим дубликат.
+		existing.LastSeen = time.Now()
+	} else {
+		b.peers[peerNodeID] = &DiscoveredPeer{
+			NodeID:       peerNodeID,
+			Addr:         peer.Addr,
+			DiscoveredAt: time.Now(),
+			LastSeen:     time.Now(),
+		}
+	}
 	peer.TLSConn = conn
 	peer.Connected = true
 	b.mu.Unlock()
 
-	log.Printf("[Beacon] TLS-соединение установлено с %s (CN=%s)",
-		addr, peerCert.Subject.CommonName)
+	log.Printf("[Beacon] TLS-соединение установлено с %s (CN=%s, nodeID=%X)",
+		addr, peerCert.Subject.CommonName, peerNodeID)
 
 	b.handlePeerConnection(peer, conn)
 }
@@ -479,10 +525,31 @@ func (b *BeaconNode) handleIncomingConnection(conn *tls.Conn, peerCert *x509.Cer
 	peerAddr, _ := net.ResolveTCPAddr("tcp", conn.RemoteAddr().String())
 	udpAddr := &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
 
+	// NodeID берётся из ключа Ed25519 в SAN сертификата — тот же расчёт, что
+	// делают соседи по discovery-пакетам. Раньше здесь использовался
+	// SubjectKeyId, из-за чего пир, найденный по UDP и по TCP, получал разные
+	// идентификаторы и две записи в карте пиров.
+	peerNodeID, err := NodeIDFromCert(peerCert)
+	if err != nil {
+		log.Printf("[Beacon] входящее соединение от %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
 	peer := &DiscoveredPeer{
-		NodeID: [16]byte(peerCert.SubjectKeyId),
+		NodeID: peerNodeID,
 		Addr:   udpAddr,
 	}
+
+	b.mu.Lock()
+	if existing, ok := b.peers[peerNodeID]; ok {
+		existing.Connected = true
+		existing.TLSConn = conn
+		existing.LastSeen = time.Now()
+		peer = existing
+	} else {
+		b.peers[peerNodeID] = peer
+	}
+	b.mu.Unlock()
 
 	buf := make([]byte, MaxPacketSize)
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))

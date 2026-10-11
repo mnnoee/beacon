@@ -14,12 +14,12 @@ import (
 )
 
 var (
-	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	styleHeader = lipgloss.NewStyle().Bold(true)
-	styleOnline = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	styleTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	styleHeader  = lipgloss.NewStyle().Bold(true)
+	styleOnline  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	styleOffline = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	styleUnknown = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	styleDim    = lipgloss.NewStyle().Faint(true)
+	styleDim     = lipgloss.NewStyle().Faint(true)
 )
 
 type peerStatus int
@@ -42,10 +42,10 @@ type peerInfo struct {
 type tickMsg time.Time
 
 type model struct {
-	peers  []peerInfo
-	name   string
-	width  int
-	height int
+	peers    []peerInfo
+	name     string
+	width    int
+	height   int
 	quitting bool
 }
 

@@ -35,16 +35,16 @@ import (
 // - Idle timeout
 // - Запрещены port forwarding и agent forwarding
 type SSHServer struct {
-	config       *Config
-	trustStore   *TrustStore
-	hostKey      *ecdsa.PrivateKey
-	sshConfig    *ssh.ServerConfig
-	listener     net.Listener
-	conns        sync.WaitGroup
-	sem          chan struct{} // семафор для ограничения подключений
-	idleTimeout  time.Duration
-	stopCh       chan struct{}
-	connCloseCh  chan struct{} // сигнал закрытия всех соединений
+	config      *Config
+	trustStore  *TrustStore
+	hostKey     *ecdsa.PrivateKey
+	sshConfig   *ssh.ServerConfig
+	listener    net.Listener
+	conns       sync.WaitGroup
+	sem         chan struct{} // семафор для ограничения подключений
+	idleTimeout time.Duration
+	stopCh      chan struct{}
+	connCloseCh chan struct{} // сигнал закрытия всех соединений
 }
 
 // NewSSHServer создаёт новый SSH-сервер на основе ключей и Trust Store маячка.
@@ -237,6 +237,11 @@ func (s *SSHServer) handleConnection(netConn net.Conn) {
 	go ssh.DiscardRequests(reqs)
 
 	// Обрабатываем каналы; range завершается при закрытии канала (client disconnect)
+	defer func() {
+		log.Printf("[SSH] сессия завершена: user=%s addr=%s duration=%v",
+			username, remoteAddr, time.Since(startTime))
+	}()
+
 	for {
 		select {
 		case <-s.connCloseCh:
@@ -253,10 +258,6 @@ func (s *SSHServer) handleConnection(netConn net.Conn) {
 			go s.handleChannel(newChan, sshConn)
 		}
 	}
-
-	duration := time.Since(startTime)
-	log.Printf("[SSH] сессия завершена: user=%s addr=%s duration=%v",
-		username, remoteAddr, duration)
 }
 
 // handleChannel обрабатывает SSH-канал (session).
@@ -548,12 +549,12 @@ func isSSHCertSignedByCA(cert *x509.Certificate, caPool *x509.CertPool) bool {
 
 // ptyRequestPayload — формат PTY-запроса SSH.
 type ptyRequestPayload struct {
-	Term    string
-	Width   uint32
-	Height  uint32
-	PixW    uint32
-	PixH    uint32
-	Modes   string
+	Term   string
+	Width  uint32
+	Height uint32
+	PixW   uint32
+	PixH   uint32
+	Modes  string
 }
 
 // parsePTYReq парсит payload PTY-запроса.

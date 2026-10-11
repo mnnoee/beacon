@@ -74,9 +74,9 @@ func testCertSetup(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certifica
 	// Создаём TrustStore с CA и доверенным сертификатом маячка
 	beaconCert, _ := x509.ParseCertificate(certDER)
 	ts := &TrustStore{
-		caPool:  x509.NewCertPool(),
-		caCert:  caCert,
-		revoked: make(map[[16]byte]RevokedEntry),
+		caPool:       x509.NewCertPool(),
+		caCert:       caCert,
+		revoked:      make(map[[16]byte]RevokedEntry),
 		trustedCerts: []*x509.Certificate{beaconCert},
 	}
 	ts.caPool.AddCert(caCert)
@@ -163,8 +163,8 @@ func TestSSHRevokedCert(t *testing.T) {
 	signer, _ := createSSHCertSigner(keyPath, certPath)
 
 	sshCfg := &ssh.ClientConfig{
-		User: "test",
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -229,8 +229,8 @@ func TestSSHSelfSignedCert(t *testing.T) {
 
 	signer, _ := createSSHCertSigner(nodeDir+"/key.pem", nodeDir+"/cert.pem")
 	sshCfg := &ssh.ClientConfig{
-		User: "test",
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		User:            "test",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 

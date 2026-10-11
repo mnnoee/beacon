@@ -4,12 +4,15 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -31,23 +34,23 @@ import (
 // - Gossip-обновления проверяются подписью (подпись = подпись CA)
 // - Максимальный размер CRL ограничен (MaxCRLSize)
 type TrustStore struct {
-	mu          sync.RWMutex
-	caCert      *x509.Certificate
-	caPool      *x509.CertPool
-	revoked     map[[16]byte]RevokedEntry // serialHash -> entry
-	trustedCerts []*x509.Certificate      // доверенные сертификаты (подписанные CA)
-	ed25519Keys map[[16]byte]ed25519.PublicKey // nodeID -> Ed25519 публичный ключ
-	crlVersion uint32
-	diskPath string
+	mu           sync.RWMutex
+	caCert       *x509.Certificate
+	caPool       *x509.CertPool
+	revoked      map[[16]byte]RevokedEntry      // serialHash -> entry
+	trustedCerts []*x509.Certificate            // доверенные сертификаты (подписанные CA)
+	ed25519Keys  map[[16]byte]ed25519.PublicKey // nodeID -> Ed25519 публичный ключ
+	crlVersion   uint32
+	diskPath     string
 }
 
 // NewTrustStore создаёт новый Trust Store и загружает данные с диска.
 func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	ts := &TrustStore{
-		caPool:      x509.NewCertPool(),
-		revoked:     make(map[[16]byte]RevokedEntry),
+		caPool:       x509.NewCertPool(),
+		revoked:      make(map[[16]byte]RevokedEntry),
 		trustedCerts: make([]*x509.Certificate, 0),
-		ed25519Keys: make(map[[16]byte]ed25519.PublicKey),
+		ed25519Keys:  make(map[[16]byte]ed25519.PublicKey),
 	}
 
 	// Загружаем CA-сертификат
@@ -228,6 +231,28 @@ func (ts *TrustStore) Revoke(serialHash [16]byte, reason uint8) error {
 	return ts.saveCRLInternal()
 }
 
+// IsRevokedBySerial проверяет, отозван ли сертификат с данным серийным номером.
+//
+// Мост между индексом CA (десятичная строка серийника) и CRL, который пока
+// хранит 16-байтовые хеши. После перехода CRL на crypto/x509 (фаза 1) отзывы
+// будут keyed по серийнику напрямую и этот метод станет тривиальным.
+func (ts *TrustStore) IsRevokedBySerial(serial *big.Int) bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	serialHex := strings.ToUpper(fmt.Sprintf("%032X", serial))
+	serialBytes, err := hex.DecodeString(serialHex)
+	if err != nil || len(serialBytes) != 16 {
+		return false
+	}
+
+	var h [16]byte
+	copy(h[:], serialBytes)
+
+	_, ok := ts.revoked[h]
+	return ok
+}
+
 // IsRevoked проверяет, отозван ли сертификат с данным хешем.
 func (ts *TrustStore) IsRevoked(serialHash [16]byte) bool {
 	ts.mu.RLock()
@@ -345,14 +370,49 @@ func (ts *TrustStore) FindCertBySSHKey(sshPubKey ssh.PublicKey) (*x509.Certifica
 	return nil, fmt.Errorf("SSH-ключ не найден в TrustStore")
 }
 
-// getTrustedCerts возвращает список доверенных сертификатов (CA + подписанные CA).
-func (ts *TrustStore) getTrustedCerts() []*x509.Certificate {
+// FindCertByNodeID ищет сертификат узла по его идентификатору.
+//
+// Идентификатор выводится из публичного ключа Ed25519 (NodeIDFromEd25519Pub),
+// поэтому поиск идёт по ключу из SAN сертификата, а не по SubjectKeyId:
+// SubjectKeyId больше не является идентификатором узла.
+func (ts *TrustStore) FindCertByNodeID(nodeID [16]byte) (*x509.Certificate, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	for _, cert := range ts.getTrustedCertsLocked() {
+		if cert == nil {
+			continue
+		}
+		certID, err := NodeIDFromCert(cert)
+		if err != nil {
+			// Сертификат без ключа Ed25519 в SAN — старый формат, пропускаем.
+			continue
+		}
+		if certID == nodeID {
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("сертификат для узла %X не найден в TrustStore", nodeID)
+}
+
+// getTrustedCertsLocked возвращает список доверенных сертификатов.
+// Вызывающий обязан удерживать ts.mu — метод не берёт блокировку сам,
+// потому что используется из мест, уже её удерживающих.
+func (ts *TrustStore) getTrustedCertsLocked() []*x509.Certificate {
 	result := make([]*x509.Certificate, 0, 1+len(ts.trustedCerts))
 	if ts.caCert != nil {
 		result = append(result, ts.caCert)
 	}
 	result = append(result, ts.trustedCerts...)
 	return result
+}
+
+// getTrustedCerts возвращает список доверенных сертификатов (CA + подписанные CA).
+func (ts *TrustStore) getTrustedCerts() []*x509.Certificate {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return ts.getTrustedCertsLocked()
 }
 
 // RegisterEd25519Key регистрирует Ed25519 публичный ключ узла.
@@ -380,49 +440,48 @@ func (ts *TrustStore) VerifyGossipSignature(senderID [16]byte, signedData, signa
 	return ed25519.Verify(key, signedData, signature)
 }
 
-// RegisterEd25519KeyFromDisk загружает Ed25519 ключи из файловой системы.
-// Ищет файлы ed25519-key.pem в поддиректориях beacon-*/.
+// RegisterEd25519KeyFromDisk регистрирует публичные ключи подписей соседей.
+//
+// Ключи берутся ИЗ СЕРТИФИКАТОВ (SAN URI), а не из файлов ed25519-key.pem.
+// Причина: для проверки подписи gossip нужен только публичный ключ, а приватный
+// лежит на своей машине. Если бы ключи брались из приватных файлов, соседям
+// пришлось бы раздавать приватные ключи — недопустимо.
+//
+// Файл ed25519-key.pem читается только в beacon.go при загрузке СОБСТВЕННОГО
+// ключа для подписи announce.
 func (ts *TrustStore) RegisterEd25519KeyFromDisk(dataDir string) {
-	entries, err := os.ReadDir(dataDir)
-	if err != nil {
-		return
-	}
+	ts.mu.RLock()
+	certs := ts.getTrustedCertsLocked()
+	ts.mu.RUnlock()
 
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "ca" {
+	registered := 0
+
+	for _, cert := range certs {
+		if cert == nil || cert.IsCA {
 			continue
 		}
-		keyPath := filepath.Join(dataDir, entry.Name(), "ed25519-key.pem")
-		keyData, err := os.ReadFile(keyPath)
+
+		pub, err := Ed25519PubFromCert(cert)
 		if err != nil {
+			// Старый формат сертификата — пропускаем, ключа в нём нет.
 			continue
 		}
 
-		block, _ := pem.Decode(keyData)
-		if block == nil {
-			continue
-		}
-
-		parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			continue
-		}
-
-		edKey, ok := parsedKey.(ed25519.PrivateKey)
-		if !ok {
-			continue
-		}
-
-		// Вычисляем nodeID из публичного ключа (первые 16 байт)
-		pubKey := edKey.Public().(ed25519.PublicKey)
-		var nodeID [16]byte
-		copy(nodeID[:], pubKey[:16])
+		nodeID := NodeIDFromEd25519Pub(pub)
 
 		ts.mu.Lock()
-		ts.ed25519Keys[nodeID] = pubKey
+		ts.ed25519Keys[nodeID] = pub
 		ts.mu.Unlock()
 
-		log.Printf("[TrustStore] загружен Ed25519 ключ: %s (nodeID=%X)", keyPath, nodeID)
+		registered++
+		log.Printf("[TrustStore] зарегистрирован ключ подписи: CN=%s nodeID=%X",
+			cert.Subject.CommonName, nodeID)
+	}
+
+	if registered == 0 {
+		log.Printf("[TrustStore] ключи подписи не найдены: в %s нет сертификатов "+
+			"с Ed25519 в SAN (нужен протокол v%d, пере-выпустите сертификаты)",
+			dataDir, ProtocolVersion)
 	}
 }
 

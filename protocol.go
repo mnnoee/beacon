@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -15,7 +16,7 @@ const MaxPayloadSize = 512
 // Структура пакета (все числа big-endian):
 //
 //	[0:4]   Magic     — 0x4245434E ("BECN"), для отличия от прочего UDP-трафика
-//	[4]     Version   — версия протокола (сейчас 1)
+//	[4]     Version   — версия протокола (сейчас 2)
 //	[5]     Type      — тип пакета (Announce/Echo/Gossip)
 //	[6:22]  NodeID    — 16-байтовый идентификатор узла
 //	[22:30] Timestamp — Unix-время в секундах (int64, big-endian)
@@ -25,6 +26,10 @@ const MaxPayloadSize = 512
 //	[64+N:128+N] Signature — Ed25519-подпись всех предыдущих байтов
 //
 // Подпись покрывает ВСё до подписи — это гарантирует целостность и подлинность.
+// Версия 2: пакеты Announce и Echo обязаны нести AnnouncePayload с публичным
+// ключом Ed25519 отправителя. Подпись проверяется этим ключом, а ключ
+// сопоставляется с сертификатом узла — так announce привязан к идентичности,
+// выданной CA, и чужой узел не может подделать своё присутствие.
 type DiscoveryPacket struct {
 	Magic     uint32
 	Version   uint8
@@ -43,6 +48,43 @@ const SignatureSize = 64
 
 // MinPacketSize — минимальный размер валидного пакета (заголовок + пустой payload + подпись)
 const MinPacketSize = PacketHeaderSize + SignatureSize // 128
+
+// AnnouncePayloadSize — фиксированный размер payload пакета Announce/Echo.
+//
+//	[0:32]  Ed25519 public key отправителя
+//
+// Остаток выделен под будущее расширение, поэтому MaxPayloadSize остаётся
+// общей границей.
+const AnnouncePayloadSize = 32
+
+// AnnouncePayload — полезная нагрузка пакетов Announce и Echo.
+//
+// Публичный ключ едет в самом пакете, а не в дополнительном обмене, потому что
+// сосед может получить его иначе — только доверившись файлу на диске отправителя.
+// С таким payload подпись проверяется сразу, а сам ключ сверяется с сертификатом,
+// подписанным нашим CA: расхождение означает подмену.
+type AnnouncePayload struct {
+	Ed25519Pub ed25519.PublicKey
+}
+
+// Serialize кодирует payload в фиксированный 32-байтовый формат.
+func (a *AnnouncePayload) Serialize() ([]byte, error) {
+	if err := ValidateEd25519Pub(a.Ed25519Pub); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), a.Ed25519Pub...), nil
+}
+
+// DeserializeAnnouncePayload разбирает payload пакета Announce/Echo.
+func DeserializeAnnouncePayload(data []byte) (*AnnouncePayload, error) {
+	if len(data) != AnnouncePayloadSize {
+		return nil, fmt.Errorf("неверный размер announce payload: %d байт (ожидается %d)",
+			len(data), AnnouncePayloadSize)
+	}
+	return &AnnouncePayload{
+		Ed25519Pub: ed25519.PublicKey(append([]byte(nil), data...)),
+	}, nil
+}
 
 // Serialize кодирует DiscoveryPacket в байты (без подписи — подпись добавляется отдельно).
 func (p *DiscoveryPacket) Serialize() []byte {
@@ -74,8 +116,11 @@ func DeserializePacket(data []byte) (*DiscoveryPacket, error) {
 	}
 
 	version := data[4]
-	if version > ProtocolVersion {
-		return nil, fmt.Errorf("неподдерживаемая версия протокола: %d", version)
+	if version != ProtocolVersion {
+		// Строгое равенство, а не «не больше»: пакеты v1 не несут
+		// публичного ключа Ed25519, поэтому подпись таких пакетов проверить
+		// нечем и принять их нельзя.
+		return nil, fmt.Errorf("неподдерживаемая версия протокола: %d (ожидается %d)", version, ProtocolVersion)
 	}
 
 	pktType := data[5]

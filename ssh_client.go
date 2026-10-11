@@ -180,7 +180,13 @@ func (c *SSHClient) resolveTarget(target string) (string, error) {
 func (c *SSHClient) discoverBeacon(name string) (string, error) {
 	log.Printf("[SSH] поиск маячка '%s' через UDP discovery...", name)
 
-	nodeID := GenerateNodeID()
+	// Подписываем probe ключом самого маячка: соседи сверяют его с сертификатом,
+	// поэтому случайный NodeID здесь недопустим.
+	edPriv, err := loadEd25519Key(c.config.Ed25519KeyPath())
+	if err != nil {
+		return "", fmt.Errorf("загрузка Ed25519-ключа для discovery: %w", err)
+	}
+	nodeID := NodeIDFromEd25519Pub(edPriv.Public().(ed25519.PublicKey))
 
 	listenAddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0}
 	conn, err := net.ListenUDP("udp4", listenAddr)
@@ -209,7 +215,7 @@ func (c *SSHClient) discoverBeacon(name string) (string, error) {
 	}()
 
 	for i := 0; i < 5; i++ {
-		c.sendBroadcastDiscovery(nodeID)
+		c.sendBroadcastDiscovery(edPriv, nodeID)
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -243,29 +249,28 @@ waitLoop:
 }
 
 // sendBroadcastDiscovery отправляет UDP broadcast-пакет с Ed25519-подписью.
-func (c *SSHClient) sendBroadcastDiscovery(nodeID [16]byte) {
+//
+// Пакет подписывается ключом САМОГО маячка, а не случайным: соседи проверяют
+// подпись ключом из нашего сертификата, поэтому announce, подписанный чужим
+// ключом, будет отвергнут. Раньше здесь читался путь к ECDSA-ключу, из-за чего
+// ключ не загружался и пакет не уходил вообще.
+func (c *SSHClient) sendBroadcastDiscovery(edPriv ed25519.PrivateKey, nodeID [16]byte) {
+	payload, err := (&AnnouncePayload{Ed25519Pub: edPriv.Public().(ed25519.PublicKey)}).Serialize()
+	if err != nil {
+		log.Printf("[SSH] формирование announce payload: %v", err)
+		return
+	}
+
 	pkt := &DiscoveryPacket{
 		Magic:     DiscoveryMagic,
 		Version:   ProtocolVersion,
 		Type:      PktAnnounce,
 		NodeID:    nodeID,
 		Timestamp: time.Now().Unix(),
+		Payload:   payload,
 	}
 
 	rand.Read(pkt.Nonce[:])
-
-	dataToSign := pkt.Serialize()
-
-	// Подписываем пакет Ed25519-ключом
-	keyPath, _, _ := c.config.BeaconPaths()
-	edKey, err := loadEd25519Key(keyPath)
-	if err != nil {
-		log.Printf("[SSH] не удалось загрузить ключ для подписи: %v", err)
-		return
-	}
-
-	signature := ed25519.Sign(edKey, dataToSign)
-	fullPacket := append(dataToSign, signature...)
 
 	addr := &net.UDPAddr{
 		IP:   net.ParseIP(c.config.BroadcastAddr),
@@ -277,7 +282,7 @@ func (c *SSHClient) sendBroadcastDiscovery(nodeID [16]byte) {
 		return
 	}
 	defer conn.Close()
-	conn.Write(fullPacket)
+	conn.Write(SignPacket(pkt, edPriv))
 }
 
 // loadEd25519Key загружает Ed25519 приватный ключ из PEM-файла.

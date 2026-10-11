@@ -1,12 +1,17 @@
 package main
 
 import (
+	"path/filepath"
 	"time"
 )
 
 const (
 	// Версия протокола обнаружения — меняется при несовместимых изменениях формата пакетов
-	ProtocolVersion uint8 = 1
+	//
+	// Версия 2: announce/echo несут публичный ключ Ed25519 отправителя, чтобы
+	// сосед мог проверить подпись пакета, имея только сертификат узла. Узлы
+	// версии 1 не умеют этого и отбрасываются.
+	ProtocolVersion uint8 = 2
 
 	// Магические байты в заголовке UDP-пакета ("BECN")
 	DiscoveryMagic = 0x4245434E
@@ -32,6 +37,11 @@ const (
 	// Время жизни корневого сертификата CA
 	DefaultCALifetime = 10 * 365 * 24 * time.Hour // 10 лет
 
+	// ed25519KeyFile — имя файла приватного Ed25519-ключа в директории узла.
+	// Публичная часть ключа хранится в сертификате (SAN URI), поэтому на диске
+	// лежит только приватная половина.
+	ed25519KeyFile = "ed25519-key.pem"
+
 	// Интервал проверки CRL и обновления Trust Store
 	DefaultCRLCheckInterval = 1 * time.Hour
 
@@ -56,29 +66,29 @@ type Config struct {
 	DataDir string
 
 	// --- Параметры CA (Главной Ноды) ---
-	CAKeyPath    string // Путь к приватному ключу CA
-	CACertPath   string // Путь к сертификату CA
-	CRLPath      string // Путь к списку отозванных сертификатов
+	CAKeyPath  string // Путь к приватному ключу CA
+	CACertPath string // Путь к сертификату CA
+	CRLPath    string // Путь к списку отозванных сертификатов
 
 	// --- Параметры Маячка ---
-	NodeName       string // Уникальное имя этого маячка (используется как CN в сертификате)
+	NodeName       string   // Уникальное имя этого маячка (используется как CN в сертификате)
 	NodeID         [16]byte // Уникальный идентификатор узла (UUID-like)
-	TLSKeyPath     string // Путь к приватному ключу маячка
-	TLSCertPath    string // Путь к сертификату маячка
-	TrustedCAPath  string // Путь к корневому сертификату CA для проверки пиров
-	TrustStorePath string // Путь к локальному Trust Store (список известных пиров)
+	TLSKeyPath     string   // Путь к приватному ключу маячка
+	TLSCertPath    string   // Путь к сертификату маячка
+	TrustedCAPath  string   // Путь к корневому сертификату CA для проверки пиров
+	TrustStorePath string   // Путь к локальному Trust Store (список известных пиров)
 
 	// --- Сетевые параметры ---
-	DiscoveryPort   int    // UDP-порт для обнаружения
-	TLSPort         int    // TCP-порт для TLS-соединений
-	BroadcastAddr   string // Адрес для UDP broadcast (например "255.255.255.255" или конкретная подсеть)
-	BindAddr        string // Адрес привязки для TCP-слушателя
-	CertTTL         time.Duration // Время жизни выдаваемых сертификатов
+	DiscoveryPort int           // UDP-порт для обнаружения
+	TLSPort       int           // TCP-порт для TLS-соединений
+	BroadcastAddr string        // Адрес для UDP broadcast (например "255.255.255.255" или конкретная подсеть)
+	BindAddr      string        // Адрес привязки для TCP-слушателя
+	CertTTL       time.Duration // Время жизни выдаваемых сертификатов
 
 	// --- Параметры безопасности ---
-	RateLimitBurst   int     // Максимум пакетов в секунду от одного IP
-	RateLimitRate    float64 // Средняя скорость (пакетов/сек)
-	MaxConnsPerPeer  int     // Максимум одновременных TLS-соединений с одним пиром
+	RateLimitBurst  int     // Максимум пакетов в секунду от одного IP
+	RateLimitRate   float64 // Средняя скорость (пакетов/сек)
+	MaxConnsPerPeer int     // Максимум одновременных TLS-соединений с одним пиром
 
 	// --- Параметры SSH-сервера ---
 	SSHPort        int           // TCP-порт SSH-сервера
@@ -86,8 +96,8 @@ type Config struct {
 	SSHIdleTimeout time.Duration // Тайм-аут неактивности для SSH
 
 	// --- Provisioning ---
-	ProvisionToken  string // Токен для offline-provisioning нового маячка
-	ProvisionName   string // Имя нового маячка для выдачи сертификата
+	ProvisionToken string // Токен для offline-provisioning нового маячка
+	ProvisionName  string // Имя нового маячка для выдачи сертификата
 }
 
 // DefaultConfig возвращает конфигурацию с параметрами по умолчанию.
@@ -123,6 +133,11 @@ func (c *Config) CAPaths() (keyPath, certPath, crlPath string) {
 		crlPath = c.CRLPath
 	}
 	return
+}
+
+// Ed25519KeyPath возвращает путь к приватному Ed25519-ключу этого маячка.
+func (c *Config) Ed25519KeyPath() string {
+	return filepath.Join(c.DataDir, c.NodeName, ed25519KeyFile)
 }
 
 // BeaconPaths возвращает пути к файлам этого маячка.

@@ -209,12 +209,3 @@ func ReadFileContents(path string) ([]byte, error) {
 	}
 	return data, nil
 }
-
-// GenerateNodeID генерирует случайный 16-байтовый идентификатор узла.
-func GenerateNodeID() [16]byte {
-	var id [16]byte
-	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
-		panic("не удалось сгенерировать random ID: " + err.Error())
-	}
-	return id
-}

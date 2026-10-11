@@ -1,12 +1,17 @@
 package main
 
 import (
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -174,6 +179,8 @@ func cmdCA(args []string) {
 	dataDir := fs.String("dir", "./beacon-data", "директория с данными CA")
 	caKeyPath := fs.String("ca-key", "", "путь к ключу CA (авто)")
 	caCertPath := fs.String("ca-cert", "", "путь к сертификату CA (авто)")
+	reissue := fs.Bool("reissue", false, "пере-выдача для существующего узла (потерян ключ)")
+	serialArg := fs.String("serial", "", "серийный номер сертификата (для revoke-beacon)")
 
 	fs.Parse(args[1:])
 
@@ -195,15 +202,20 @@ func cmdCA(args []string) {
 			os.Exit(1)
 		}
 		nodeName := fs.Arg(0)
-		cmdProvisionBeacon(*dataDir, *caKeyPath, *caCertPath, nodeName)
+		cmdProvisionBeacon(*dataDir, *caKeyPath, *caCertPath, nodeName, *reissue)
 
 	case "revoke-beacon":
-		if fs.NArg() < 1 {
-			fmt.Fprintln(os.Stderr, "укажите serial hash: beacon ca revoke-beacon <hex-serial>")
+		if fs.NArg() < 1 && *serialArg == "" {
+			fmt.Fprintln(os.Stderr, "укажите серийный номер: beacon ca revoke-beacon -serial <номер>")
 			os.Exit(1)
 		}
-		serialHex := fs.Arg(0)
-		cmdRevokeBeacon(*dataDir, serialHex)
+		// Приоритет у флага: значение копипастом из list-trusted.
+		// Позиционный аргумент оставлен для обратной совместимости.
+		target := *serialArg
+		if target == "" {
+			target = fs.Arg(0)
+		}
+		cmdRevokeBeacon(*dataDir, target)
 
 	case "list-trusted":
 		cmdListTrusted(*dataDir)
@@ -259,18 +271,85 @@ func cmdGenerateCA(dataDir, caKeyPath, caCertPath string) {
 	fmt.Println(string(certPEM))
 }
 
-// cmdProvisionBeacon выдаёт сертификат новому маячку.
-func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string) {
-	fmt.Printf("Выдача сертификата для маячка: %s\n", nodeName)
+// normalizeNodeName проверяет и нормализует имя узла (CN).
+//
+// Префикс beacon- добавляется автоматически, но проверка длины идёт ДО
+// добавления: иначе опечатка из двух символов молча превратилась бы в
+// валидное имя beacon-xx, и пользователь не заметил бы промаха.
+func normalizeNodeName(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
 
-	// Валидация имени
-	if len(nodeName) < 3 || len(nodeName) > 63 {
-		fmt.Fprintln(os.Stderr, "имя должно быть от 3 до 63 символов")
+	if trimmed == "" {
+		return "", fmt.Errorf("имя узла не может быть пустым")
+	}
+
+	// Минимум проверяем по исходному имени, до добавления префикса: иначе
+	// опечатка из двух символов молча превратилась бы в валидное "beacon-xx",
+	// и пользователь не заметил бы промаха.
+	if len(trimmed) < 3 {
+		return "", fmt.Errorf("имя должно быть не короче 3 символов (получено %d)", len(trimmed))
+	}
+
+	if len(trimmed) > 63 {
+		return "", fmt.Errorf("имя должно быть не длиннее 63 символов (получено %d)", len(trimmed))
+	}
+
+	if !strings.HasPrefix(trimmed, "beacon-") {
+		if len(trimmed)+len("beacon-") > 63 {
+			return "", fmt.Errorf("имя с префиксом beacon- превысит 63 символа (получено %d)", len(trimmed))
+		}
+		trimmed = "beacon-" + trimmed
+	}
+
+	return trimmed, nil
+}
+
+// cmdProvisionBeacon выдаёт сертификат новому маячку.
+//
+// Обычный вызов — только для новых имён: если CN уже есть в индексе CA,
+// команда отказывает и предлагает -reissue. Это защищает от ситуации, когда
+// опечатка или потерянный ключ молча выдают второй сертификат на то же имя:
+// в сети появляются два узла с одинаковым CN, и отзыв одного задевает оба.
+//
+// -reissue — пере-выдача для существующего имени (устройство потеряло ключ).
+// Старый сертификат при этом НЕ отзывается автоматически: он остаётся валидным
+// до конца TTL, и пользователю выводится его серийный номер для ручного отзыва.
+func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue bool) {
+	if reissue {
+		fmt.Printf("Пере-выдача сертификата для маячка: %s\n", nodeName)
+	} else {
+		fmt.Printf("Выдача сертификата для маячка: %s\n", nodeName)
+	}
+
+	nodeName, err := normalizeNodeName(nodeName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if !strings.HasPrefix(nodeName, "beacon-") {
-		nodeName = "beacon-" + nodeName
-		fmt.Printf("  (добавлен префикс: %s)\n", nodeName)
+
+	idx, err := LoadCAIndex(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "чтение индекса CA: %v\n", err)
+		os.Exit(1)
+	}
+
+	existing, exists := idx.Lookup(nodeName)
+
+	if exists && !reissue {
+		fmt.Fprintf(os.Stderr, "сертификат для %s уже выдан %s\n", nodeName, existing.IssuedAt)
+		fmt.Fprintf(os.Stderr, "серийный номер: %s\n", existing.Serial)
+		fmt.Fprintln(os.Stderr, "\nЕсли устройство потеряло ключ, пере-выпустите сертификат:")
+		fmt.Fprintf(os.Stderr, "  beacon ca provision-beacon -reissue -dir %s %s\n", dataDir, nodeName)
+		os.Exit(1)
+	}
+
+	if !exists && reissue {
+		fmt.Fprintf(os.Stderr, "сертификат для %s не найден в индексе CA\n", nodeName)
+		fmt.Fprintln(os.Stderr, "возможно, имя указано с ошибкой. Доступные узлы:")
+		for _, name := range idx.Names() {
+			fmt.Fprintf(os.Stderr, "  - %s\n", name)
+		}
+		os.Exit(1)
 	}
 
 	// Загружаем CA
@@ -286,41 +365,63 @@ func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string) {
 		os.Exit(1)
 	}
 
-	// Генерируем Node ID
-	nodeID := GenerateNodeID()
+	// Архивируем прежний сертификат: пере-выдача перезапишет cert.pem, а его
+	// серийник мы сейчас покажем пользователю для отзыва — искать его потом
+	// будет негде.
+	if exists {
+		if err := ArchiveCertIfPresent(dataDir, nodeName); err != nil {
+			fmt.Fprintf(os.Stderr, "архивирование прежнего сертификата: %v\n", err)
+			fmt.Fprintln(os.Stderr, "выдача прервана, чтобы не потерять сертификат для отзыва")
+			os.Exit(1)
+		}
+	}
 
-	// Выдаём сертификат
-	certPath, keyPath, err := IssueCertificate(caKey, caCertData, dataDir, nodeName, nodeID, DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, caCertData, dataDir, nodeName, DefaultCertTTL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка выдачи сертификата: %v\n", err)
 		os.Exit(1)
 	}
 
+	idx.Nodes[nodeName] = NewEntry(issued.Serial, issued.NodeID)
+	if err := SaveCAIndex(dataDir, idx); err != nil {
+		fmt.Fprintf(os.Stderr, "сохранение индекса CA: %v\n", err)
+		fmt.Fprintln(os.Stderr, "сертификат выпущен, но индекс не обновлён — повторите выдачу")
+		os.Exit(1)
+	}
+
 	fmt.Println("Сертификат успешно выдан:")
-	fmt.Printf("  Node ID:    %X\n", nodeID)
-	fmt.Printf("  Сертификат: %s\n", certPath)
-	fmt.Printf("  Ключ:       %s (права 0600)\n", keyPath)
+	fmt.Printf("  Node ID:      %X\n", issued.NodeID)
+	fmt.Printf("  Серийный:     %s\n", issued.Serial)
+	fmt.Printf("  Сертификат:   %s\n", issued.CertPath)
+	fmt.Printf("  Ключ TLS:     %s (права 0600)\n", issued.KeyPath)
+	fmt.Printf("  Ключ Ed25519: %s (права 0600)\n", issued.Ed25519Path)
+
+	if exists {
+		fmt.Println()
+		fmt.Println("ВНИМАНИЕ: это пере-выдача. Старый сертификат всё ещё валиден,")
+		fmt.Printf("  его серийный номер: %s\n", existing.Serial)
+		fmt.Println("В сети будут два сертификата с одинаковым CN. Отзовите старый:")
+		fmt.Printf("  beacon ca revoke-beacon -serial %s\n", existing.Serial)
+	}
+
 	fmt.Println()
 	fmt.Println("Для запуска маячка:")
 	fmt.Printf("  beacon beacon -name %s\n", nodeName)
 }
 
 // cmdRevokeBeacon отзывает сертификат маячка.
-func cmdRevokeBeacon(dataDir, serialHex string) {
-	// Парсим hex serial hash (16 байт = 32 hex символа)
-	if len(serialHex) != 32 {
-		fmt.Fprintf(os.Stderr, "serial hash должен быть 32 hex символа (16 байт), получено: %d\n", len(serialHex))
+//
+// Принимает либо серийный номер сертификата (десятичная строка из
+// `ca list-trusted` — рекомендуемый способ), либо legacy-хеш из 32 hex-символов.
+//
+// Сейчас CRL хранит не серийники, а хеш от CN (ComputeSerialHash), поэтому
+// серийник сначала резолвится в сертификат на диске, а уже от него берётся
+// хеш. Переход CRL на настоящие серийники — фаза 1, тогда резолвинг исчезнет.
+func cmdRevokeBeacon(dataDir, serialArg string) {
+	serialHash, err := resolveRevocationTarget(dataDir, serialArg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ошибка отзыва: %v\n", err)
 		os.Exit(1)
-	}
-
-	var serialHash [16]byte
-	for i := 0; i < 16; i++ {
-		b, ok := parseHexByte(serialHex[i*2], serialHex[i*2+1])
-		if !ok {
-			fmt.Fprintf(os.Stderr, "невалидный hex: %s\n", serialHex)
-			os.Exit(1)
-		}
-		serialHash[i] = b
 	}
 
 	if err := RevokeCertificate(dataDir, serialHash, 1); err != nil {
@@ -328,8 +429,86 @@ func cmdRevokeBeacon(dataDir, serialHex string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Сертификат %X отозван.\n", serialHash)
+	fmt.Printf("Сертификат %s отозван (CRL-ключ %X).\n", serialArg, serialHash)
 	fmt.Println("CRL обновлён. Маячки получат обновление через gossip-протокол.")
+}
+
+// resolveRevocationTarget приводит аргумент команды отзыва к 16-байтовому
+// ключу записи CRL.
+func resolveRevocationTarget(dataDir, arg string) ([16]byte, error) {
+	arg = strings.TrimSpace(arg)
+
+	// Legacy-путь: 32 hex-символа — готовый хеш.
+	if len(arg) == 32 {
+		raw, err := hex.DecodeString(arg)
+		if err == nil {
+			var h [16]byte
+			copy(h[:], raw)
+			return h, nil
+		}
+	}
+
+	// Основной путь: десятичный серийный номер. Ищем сертификат с таким
+	// серийником среди выпущенных и берём его CRL-ключ.
+	serial, ok := new(big.Int).SetString(arg, 10)
+	if !ok {
+		return [16]byte{}, fmt.Errorf("аргумент '%s' не является ни серийным номером, ни 32-hex хешем", arg)
+	}
+
+	cert, err := findCertBySerial(dataDir, serial)
+	if err != nil {
+		return [16]byte{}, err
+	}
+
+	fmt.Printf("Найден сертификат CN=%s\n", cert.Subject.CommonName)
+	return ComputeSerialHash(cert), nil
+}
+
+// findCertBySerial ищет выпущенный сертификат по серийному номеру.
+//
+// Сначала сканируются живые каталоги узлов, затем архив заменённых
+// (ca/replaced/) — туда попадают сертификаты, вытесненные пере-выдачей.
+// Без архива старый сертификат пере-выданного узла было бы негде искать.
+func findCertBySerial(dataDir string, serial *big.Int) (*x509.Certificate, error) {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("чтение каталога данных: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "ca" || entry.Name() == "peers" {
+			continue
+		}
+
+		certPath := filepath.Join(dataDir, entry.Name(), "cert.pem")
+		certData, err := os.ReadFile(certPath)
+		if err != nil {
+			continue
+		}
+
+		block, _ := pem.Decode(certData)
+		if block == nil {
+			continue
+		}
+
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+
+		if cert.SerialNumber.Cmp(serial) == 0 {
+			return cert, nil
+		}
+	}
+
+	// Не нашли среди живых — ищем в архиве заменённых сертификатов.
+	cert, err := findCertBySerialInArchive(dataDir, serial)
+	if err == nil {
+		return cert, nil
+	}
+
+	return nil, fmt.Errorf("сертификат с серийным номером %s не найден — "+
+		"проверьте номер по 'beacon ca list-trusted -dir %s'", serial, dataDir)
 }
 
 // cmdListTrusted выводит список доверенных узлов.
@@ -348,16 +527,49 @@ func cmdListTrusted(dataDir string) {
 	fmt.Printf("CA: %s (CN=%s)\n", certPath, caCert.Subject.CommonName)
 	fmt.Printf("    Валиден до: %s\n", caCert.NotAfter.Format("2006-01-02"))
 
-	// Загружаем CRL
+	// Выданные узлы с серийными номерами: именно эти номера нужны для
+	// revoke-beacon, раньше их было негде взять.
+	idx, err := LoadCAIndex(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "чтение индекса CA: %v\n", err)
+		os.Exit(1)
+	}
+
 	ts, err := NewTrustStore(certPath, crlPath)
 	if err != nil {
 		fmt.Printf("CRL: не загружен (%v)\n", err)
+	}
+
+	if len(idx.Nodes) == 0 {
+		fmt.Println("\nУзлы не выданы (пустой индекс CA).")
 	} else {
-		entries := ts.GetRevokedEntries()
-		fmt.Printf("CRL: версия %d, отозвано %d сертификатов\n", ts.CRLVersion(), len(entries))
-		for _, entry := range entries {
-			fmt.Printf("  - %X (причина: %d)\n", entry.SerialHash, entry.Reason)
+		fmt.Println()
+		fmt.Printf("%-20s %-34s %-8s %s\n", "ИМЯ", "NODE ID", "СТАТУС", "СЕРИЙНЫЙ НОМЕР")
+		fmt.Println(strings.Repeat("-", 100))
+
+		for _, cn := range idx.Names() {
+			entry := idx.Nodes[cn]
+
+			status := "ACTIVE"
+			if ts != nil {
+				serial, err := entry.SerialNumber()
+				if err == nil && ts.IsRevokedBySerial(serial) {
+					status = "REVOKED"
+				}
+			}
+
+			fmt.Printf("%-20s %-34s %-8s %s\n", cn, entry.NodeID, status, entry.Serial)
 		}
+	}
+
+	if ts == nil {
+		return
+	}
+
+	entries := ts.GetRevokedEntries()
+	fmt.Printf("\nCRL: версия %d, отозвано %d сертификатов\n", ts.CRLVersion(), len(entries))
+	for _, entry := range entries {
+		fmt.Printf("  - %X (причина: %d)\n", entry.SerialHash, entry.Reason)
 	}
 }
 

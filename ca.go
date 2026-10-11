@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -45,9 +47,9 @@ func GenerateCA(dataDir string, lifetime time.Duration) (*ecdsa.PrivateKey, []by
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization:  []string{"Network Beacons"},
-			CommonName:    "Root CA",
-			Country:       []string{"RU"},
+			Organization: []string{"Network Beacons"},
+			CommonName:   "Root CA",
+			Country:      []string{"RU"},
 		},
 		NotBefore:             time.Now().Add(-time.Minute), // небольшой запас на синхронизацию часов
 		NotAfter:              time.Now().Add(lifetime),
@@ -100,40 +102,78 @@ func GenerateCA(dataDir string, lifetime time.Duration) (*ecdsa.PrivateKey, []by
 	return privateKey, certPEM, nil
 }
 
+// IssuedNode — результат выдачи сертификата маячку.
+type IssuedNode struct {
+	// CertPath, KeyPath — TLS/SSH-ключи (ECDSA P-256).
+	CertPath string
+	KeyPath  string
+
+	// Ed25519Path — приватный ключ подписей discovery и gossip.
+	Ed25519Path string
+
+	// Ed25519Pub — публичный ключ, попавший в SAN URI сертификата.
+	Ed25519Pub ed25519.PublicKey
+
+	// NodeID — идентификатор узла, выведенный из Ed25519Pub.
+	NodeID [16]byte
+
+	// Serial — серийный номер сертификата, ключ отзыва.
+	Serial *big.Int
+}
+
 // IssueCertificate выдаёт сертификат для нового маячка (или другого узла).
 //
-// Параметры:
-// - caKey: приватный ключ CA для подписи
-// - caCertPEM: PEM-кодированный сертификат CA
-// - nodeName: CN (Common Name) нового узла — уникальное имя в сети
-// - ttl: время жизни сертификата
-// - nodeID: 16-байтовый идентификатор (для включения в Subject Alternative Name)
+// Узел получает ДВЕ пары ключей:
+//   - ECDSA P-256 — для mTLS и SSH;
+//   - Ed25519 — для подписей discovery-пакетов и gossip.
 //
-// Формат выдачи: пары ключей (key + cert) сохраняются в директорию узла.
-// Для безопасной передачи — зашифрованы на диске + копия на внешний носитель.
+// Публичный ключ Ed25519 включается в сертификат как SAN URI
+// (urn:beacon:ed25519:<base64url>). Это делает идентичность узла
+// криптографически привязанной к выданному сертификату: сосед может проверить
+// подпись discovery-пакета, имея только сертификат, без доверия к файлу на диске
+// и без отдельного обмена ключами.
+//
+// nodeID больше не задаётся снаружи и не пишется в SubjectKeyId: он
+// вычисляется из Ed25519-ключа (см. NodeIDFromEd25519Pub), чтобы все стороны
+// приходили к одному значению одинаково.
+//
+// Формат выдачи: файлы сохраняются в dataDir/<nodeName>/.
+// key.pem    — ECDSA P-256, права 0600
+// cert.pem   — сертификат x509, права 0644
+// ed25519-key.pem — Ed25519, права 0600
 func IssueCertificate(
 	caKey *ecdsa.PrivateKey,
 	caCertPEM []byte,
 	dataDir string,
 	nodeName string,
-	nodeID [16]byte,
 	ttl time.Duration,
-) (certPath string, keyPath string, err error) {
+) (*IssuedNode, error) {
 	// Загружаем CA-сертификат для парсинга
 	caCert, err := ParseCertificatePEM(caCertPEM)
 	if err != nil {
-		return "", "", fmt.Errorf("парсинг CA-сертификата: %w", err)
+		return nil, fmt.Errorf("парсинг CA-сертификата: %w", err)
 	}
 
-	// Генерируем ключ для нового узла
+	// Ключ для TLS и SSH
 	nodeKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return "", "", fmt.Errorf("генерация ключа узла: %w", err)
+		return nil, fmt.Errorf("генерация ключа узла: %w", err)
+	}
+
+	// Ключ для подписей discovery и gossip
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("генерация Ed25519-ключа: %w", err)
+	}
+
+	edURI, err := Ed25519URIValue(edPub)
+	if err != nil {
+		return nil, fmt.Errorf("формирование SAN URI: %w", err)
 	}
 
 	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return "", "", fmt.Errorf("генерация serial number: %w", err)
+		return nil, fmt.Errorf("генерация serial number: %w", err)
 	}
 
 	template := &x509.Certificate{
@@ -152,14 +192,16 @@ func IssueCertificate(
 		},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
-		// Subject Key Identifier — хеш от публичного ключа (для удобства поиска)
-		SubjectKeyId: nodeID[:],
+		// Идентичность узла: публичный ключ Ed25519 в SAN.
+		// nodeID выводится из него, поэтому SubjectKeyId для идентификации
+		// больше не используется и оставлен пустым — Go вычислит его сам.
+		URIs: []*url.URL{edURI},
 	}
 
 	// Подписываем сертификат CA-ключом
 	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &nodeKey.PublicKey, caKey)
 	if err != nil {
-		return "", "", fmt.Errorf("подписание сертификата: %w", err)
+		return nil, fmt.Errorf("подписание сертификата: %w", err)
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{
@@ -169,7 +211,7 @@ func IssueCertificate(
 
 	keyDER, err := x509.MarshalECPrivateKey(nodeKey)
 	if err != nil {
-		return "", "", fmt.Errorf("маршализация ключа: %w", err)
+		return nil, fmt.Errorf("маршализация ключа: %w", err)
 	}
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{
@@ -177,24 +219,42 @@ func IssueCertificate(
 		Bytes: keyDER,
 	})
 
+	edPrivPEM, err := SerializePrivateKeyPEM(edPriv)
+	if err != nil {
+		return nil, fmt.Errorf("маршализация Ed25519-ключа: %w", err)
+	}
+
 	// Сохраняем файлы узла
 	nodeDir := filepath.Join(dataDir, nodeName)
 	if err := os.MkdirAll(nodeDir, 0700); err != nil {
-		return "", "", fmt.Errorf("создание директории узла: %w", err)
+		return nil, fmt.Errorf("создание директории узла: %w", err)
 	}
 
-	keyPath = filepath.Join(nodeDir, "key.pem")
-	certPath = filepath.Join(nodeDir, "cert.pem")
+	keyPath := filepath.Join(nodeDir, "key.pem")
+	certPath := filepath.Join(nodeDir, "cert.pem")
+	edPath := filepath.Join(nodeDir, ed25519KeyFile)
 
+	// Приватные ключи — 0600, сертификат публичный — 0644.
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
-		return "", "", fmt.Errorf("сохранение ключа узла: %w", err)
+		return nil, fmt.Errorf("сохранение ключа узла: %w", err)
+	}
+
+	if err := os.WriteFile(edPath, edPrivPEM, 0600); err != nil {
+		return nil, fmt.Errorf("сохранение Ed25519-ключа: %w", err)
 	}
 
 	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return "", "", fmt.Errorf("сохранение сертификата узла: %w", err)
+		return nil, fmt.Errorf("сохранение сертификата узла: %w", err)
 	}
 
-	return certPath, keyPath, nil
+	return &IssuedNode{
+		CertPath:    certPath,
+		KeyPath:     keyPath,
+		Ed25519Path: edPath,
+		Ed25519Pub:  edPub,
+		NodeID:      NodeIDFromEd25519Pub(edPub),
+		Serial:      serialNumber,
+	}, nil
 }
 
 // ParseCertificatePEM парсит PEM-кодированный сертификат.
