@@ -91,9 +91,17 @@ type Config struct {
 	MaxConnsPerPeer int     // Максимум одновременных TLS-соединений с одним пиром
 
 	// --- Параметры SSH-сервера ---
-	SSHPort        int           // TCP-порт SSH-сервера
-	SSHMaxConns    int           // Максимум одновременных SSH-подключений
-	SSHIdleTimeout time.Duration // Тайм-аут неактивности для SSH
+	// SSH выключен по умолчанию: включение открывает shell пользователю,
+	// от имени которого работает маячок (обычно root), любому узлу сети с
+	// валидным сертификатом. Решение об этом должно приниматься явно.
+	SSHEnabled       bool          // Включить SSH-сервер (флаг -ssh)
+	SSHPort          int           // TCP-порт SSH-сервера
+	SSHMaxConns      int           // Максимум одновременных SSH-подключений
+	SSHIdleTimeout   time.Duration // Тайм-аут неактивности для SSH
+	SSHShell         string        // Интерпретатор для сессий (по умолчанию /bin/sh)
+	SSHAllowCNs      []string      // Разрешённые CN (пустой список при -ssh = отказ всем)
+	SSHAllowCommands []string      // Разрешённые exec-команды (пустой = любой exec)
+	SSHInteractive   bool          // Разрешить интерактивный shell
 
 	// --- Provisioning ---
 	ProvisionToken string // Токен для offline-provisioning нового маячка
@@ -115,6 +123,13 @@ func DefaultConfig() *Config {
 		SSHPort:         2222,
 		SSHMaxConns:     10,
 		SSHIdleTimeout:  10 * time.Minute,
+		// Shell по умолчанию — /bin/sh: bash не обязан существовать
+		// (например на mipsle-роутерах под OpenWrt).
+		SSHShell: "/bin/sh",
+		// Интерактивный shell разрешён: он всё ещё требует -ssh и непустого
+		// -ssh-allow, поэтому отказ по умолчанию здесь ослабил бы безопасность
+		// только при явно включённом SSH.
+		SSHInteractive: true,
 	}
 }
 

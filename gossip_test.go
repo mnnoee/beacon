@@ -26,7 +26,7 @@ func setupGossipTest(t *testing.T) (sender, receiver *BeaconNode) {
 	}
 
 	issue := func(cn string) *IssuedNode {
-		issued, err := IssueCertificate(caKey, caCertPEM, dir, cn, DefaultCertTTL)
+		issued, err := IssueCertificate(caKey, caCertPEM, dir, cn, DefaultCertTTL, RolePeer)
 		if err != nil {
 			t.Fatalf("IssueCertificate(%s): %v", cn, err)
 		}
@@ -75,7 +75,7 @@ func TestGossipSignatureRequired(t *testing.T) {
 	}
 
 	victim, err := IssueCertificate(caKey, caCertPEM, sender.config.DataDir,
-		"beacon-victim", DefaultCertTTL)
+		"beacon-victim", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("выдача сертификата жертвы: %v", err)
 	}

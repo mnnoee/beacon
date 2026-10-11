@@ -207,7 +207,7 @@ func TestLegacyCRLConversion(t *testing.T) {
 
 	caKey, _ := LoadCAKey(caKeyPath)
 
-	issued, err := IssueCertificate(caKey, caCertPEM, dir, "beacon-legacy", DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, caCertPEM, dir, "beacon-legacy", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("IssueCertificate: %v", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -121,6 +122,63 @@ type IssuedNode struct {
 	Serial *big.Int
 }
 
+// CertificateRole — роль, на которую выдаётся сертификат.
+//
+// Разделение нужно, потому что SSH-доступ и участие в сетевом обмене —
+// разные privileges. Клиентский сертификат позволяет маячку подключаться
+// к соседям, но не даёт авторизоваться на их SSH-сервере. Иначе компрометация
+// любого узла означает root на всех сразу.
+type CertificateRole int
+
+const (
+	// RolePeer — участие в сети: mTLS, discovery, gossip. SSH-доступа нет.
+	RolePeer CertificateRole = iota
+
+	// RoleServer — то же плюс вход на SSH-сервер этого узла.
+	RoleServer
+)
+
+// String возвращает имя роли для вывода.
+func (r CertificateRole) String() string {
+	switch r {
+	case RoleServer:
+		return "server"
+	default:
+		return "peer"
+	}
+}
+
+// ParseRole разбирает имя роли из флага -role.
+func ParseRole(s string) (CertificateRole, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "server", "admin":
+		return RoleServer, nil
+	case "peer", "client", "":
+		return RolePeer, nil
+	default:
+		return RolePeer, fmt.Errorf("неизвестная роль %q (ожидается peer или server)", s)
+	}
+}
+
+// extKeyUsagesForRole возвращает Extended Key Usage для роли.
+//
+// RoleServer получает оба EKU — клиент и сервер: он и подключается к соседям,
+// и принимает SSH-подключения.
+//
+// RolePeer получает только ClientAuth. Важно, что x509.Certificate сам
+// отвергнет такой сертификат при проверке как серверный (Go требует
+// ExtKeyUsageServerAuth для серверного side handshake), поэтому клиентские
+// узлы физически не смогут слушать mTLS-серверную часть, даже если захотят.
+func (r CertificateRole) extKeyUsages() []x509.ExtKeyUsage {
+	if r == RoleServer {
+		return []x509.ExtKeyUsage{
+			x509.ExtKeyUsageClientAuth,
+			x509.ExtKeyUsageServerAuth,
+		}
+	}
+	return []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+}
+
 // IssueCertificate выдаёт сертификат для нового маячка (или другого узла).
 //
 // Узел получает ДВЕ пары ключей:
@@ -147,6 +205,7 @@ func IssueCertificate(
 	dataDir string,
 	nodeName string,
 	ttl time.Duration,
+	role CertificateRole,
 ) (*IssuedNode, error) {
 	// Загружаем CA-сертификат для парсинга
 	caCert, err := ParseCertificatePEM(caCertPEM)
@@ -186,10 +245,9 @@ func IssueCertificate(
 		NotBefore: time.Now().Add(-time.Minute),
 		NotAfter:  time.Now().Add(ttl),
 		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageClientAuth,
-			x509.ExtKeyUsageServerAuth,
-		},
+		// Роль ограничивает применение сертификата: клиентский не сможет
+		// работать серверным side mTLS и не будет принят SSH-сервером.
+		ExtKeyUsage:           role.extKeyUsages(),
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 		// Идентичность узла: публичный ключ Ed25519 в SAN.

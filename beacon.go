@@ -247,7 +247,17 @@ func (b *BeaconNode) Start() error {
 }
 
 // startSSHServer запускает встроенный SSH-сервер.
+//
+// По умолчанию SSH выключен. Маячок работает под именем пользователя, который
+// его запустил (часто root), и с включённым SSH любой узел сети с сертификатом
+// роли server получает shell. Поэтому включать его надо явно, а не по факту
+// наличия ключей.
 func (b *BeaconNode) startSSHServer() {
+	if !b.config.SSHEnabled {
+		log.Printf("[Beacon] SSH-сервер выключен (включить: -ssh, разрешить вход: -ssh-allow <CN>)")
+		return
+	}
+
 	sshSrv, err := NewSSHServer(b.config, b.trustStore)
 	if err != nil {
 		log.Printf("[Beacon] не удалось создать SSH-сервер: %v", err)
@@ -261,7 +271,9 @@ func (b *BeaconNode) startSSHServer() {
 		return
 	}
 
-	log.Printf("[Beacon] SSH-сервер запущен на порту %d", b.config.SSHPort)
+	allowed := b.config.SSHAllowCNs
+	log.Printf("[Beacon] SSH-сервер запущен на порту %d (разрешено CN: %d + собственный)",
+		b.config.SSHPort, len(allowed))
 }
 
 // Stop останавливает все подсистемы.

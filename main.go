@@ -180,6 +180,7 @@ func cmdCA(args []string) {
 	caCertPath := fs.String("ca-cert", "", "путь к сертификату CA (авто)")
 	reissue := fs.Bool("reissue", false, "пере-выдача для существующего узла (потерян ключ)")
 	serialArg := fs.String("serial", "", "серийный номер сертификата (для revoke-beacon)")
+	role := fs.String("role", "peer", "роль сертификата: peer (участие в сети) или server (плюс SSH)")
 
 	fs.Parse(args[1:])
 
@@ -201,7 +202,7 @@ func cmdCA(args []string) {
 			os.Exit(1)
 		}
 		nodeName := fs.Arg(0)
-		cmdProvisionBeacon(*dataDir, *caKeyPath, *caCertPath, nodeName, *reissue)
+		cmdProvisionBeacon(*dataDir, *caKeyPath, *caCertPath, nodeName, *reissue, *role)
 
 	case "revoke-beacon":
 		if fs.NArg() < 1 && *serialArg == "" {
@@ -313,18 +314,25 @@ func normalizeNodeName(name string) (string, error) {
 // -reissue — пере-выдача для существующего имени (устройство потеряло ключ).
 // Старый сертификат при этом НЕ отзывается автоматически: он остаётся валидным
 // до конца TTL, и пользователю выводится его серийный номер для ручного отзыва.
-func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue bool) {
+func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue bool, roleName string) {
+	role, err := ParseRole(roleName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	if reissue {
 		fmt.Printf("Пере-выдача сертификата для маячка: %s\n", nodeName)
 	} else {
 		fmt.Printf("Выдача сертификата для маячка: %s\n", nodeName)
 	}
 
-	nodeName, err := normalizeNodeName(nodeName)
+	normalized, err := normalizeNodeName(nodeName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	nodeName = normalized
 
 	idx, err := LoadCAIndex(dataDir)
 	if err != nil {
@@ -375,7 +383,7 @@ func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue
 		}
 	}
 
-	issued, err := IssueCertificate(caKey, caCertData, dataDir, nodeName, DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, caCertData, dataDir, nodeName, DefaultCertTTL, role)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка выдачи сертификата: %v\n", err)
 		os.Exit(1)
@@ -389,6 +397,7 @@ func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue
 	}
 
 	fmt.Println("Сертификат успешно выдан:")
+	fmt.Printf("  Роль:        %s\n", role)
 	fmt.Printf("  Node ID:      %X\n", issued.NodeID)
 	fmt.Printf("  Серийный:     %s\n", issued.Serial)
 	fmt.Printf("  Сертификат:   %s\n", issued.CertPath)
@@ -617,22 +626,41 @@ func cmdBeacon(args []string) {
 	var idleTimeout time.Duration
 	fs.DurationVar(&idleTimeout, "ssh-idle-timeout", cfg.SSHIdleTimeout, "idle timeout SSH")
 
+	// SSH включён только при -ssh. По умолчанию маячок отдаёт shell
+	// пользователю, от имени которого запущен (часто root), любому узлу
+	// с валидным сертификатом — поэтому это выбор владельца, а не дефолт.
+	sshEnabled := fs.Bool("ssh", false, "включить SSH-сервер на этом узле")
+	sshAllow := fs.String("ssh-allow", "", "CN, которым разрешён вход (через запятую)")
+	sshAllowCommands := fs.String("ssh-allow-commands", "", "разрешённые exec-команды (через запятую)")
+	sshShell := fs.String("ssh-shell", cfg.SSHShell, "интерпретатор для SSH-сессий")
+
 	fs.Parse(args)
 
 	if idleTimeout > 0 {
 		cfg.SSHIdleTimeout = idleTimeout
 	}
 
+	// SSH-политика из флагов.
+	cfg.SSHEnabled = *sshEnabled
+	cfg.SSHAllowCNs = splitAndTrim(*sshAllow)
+	cfg.SSHAllowCommands = splitAndTrim(*sshAllowCommands)
+	cfg.SSHShell = *sshShell
+
 	if cfg.NodeName == "" {
 		fmt.Fprintln(os.Stderr, "укажите имя маячка: beacon beacon -name <имя>")
 		os.Exit(1)
 	}
 
+	if cfg.SSHEnabled && len(cfg.SSHAllowCNs) == 0 {
+		log.Printf("[SSH] включён, но -ssh-allow пуст: вход разрешён только узлу с "+
+			"CN=%s. Добавьте -ssh-allow beacon-<имя>, чтобы пускать других", cfg.NodeName)
+	}
+
 	// Логируем конфигурацию
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Printf("[Main] запуск маячка '%s' (discovery: %s:%d, tls: %s:%d, ssh: %s:%d)",
+	log.Printf("[Main] запуск маячка '%s' (discovery: %s:%d, tls: %s:%d, ssh: %s)",
 		cfg.NodeName, cfg.BroadcastAddr, cfg.DiscoveryPort,
-		cfg.BindAddr, cfg.TLSPort, cfg.BindAddr, cfg.SSHPort)
+		cfg.BindAddr, cfg.TLSPort, sshState(cfg))
 
 	// Создаём и запускаем узел
 	node, err := NewBeaconNode(cfg)
@@ -653,6 +681,28 @@ func cmdBeacon(args []string) {
 
 	node.Stop()
 	log.Println("[Main] маячок остановлен")
+}
+
+// splitAndTrim разбивает список через запятую, отбрасывая пустые элементы.
+func splitAndTrim(s string) []string {
+	var out []string
+
+	for _, part := range strings.Split(s, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+
+	return out
+}
+
+// sshState описывает состояние SSH для лога запуска.
+func sshState(cfg *Config) string {
+	if !cfg.SSHEnabled {
+		return "выключен"
+	}
+	return fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.SSHPort)
 }
 
 // parseHexByte парсит один hex-байт из двух символов.

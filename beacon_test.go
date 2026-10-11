@@ -62,7 +62,7 @@ func TestEd25519InCertificateSAN(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	issued, err := IssueCertificate(caKey, certPEM, dir, "beacon-san", DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, certPEM, dir, "beacon-san", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("IssueCertificate: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestDiscoverySignatureRejectsSpoofing(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	honest, err := IssueCertificate(caKey, certPEM, dir, "beacon-honest", DefaultCertTTL)
+	honest, err := IssueCertificate(caKey, certPEM, dir, "beacon-honest", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("IssueCertificate: %v", err)
 	}
@@ -225,11 +225,11 @@ func TestFullPKIWorkflow(t *testing.T) {
 	t.Logf("CA: CN=%s fingerprint=%s", caCert.Subject.CommonName, Fingerprint(caCert))
 
 	// Выдача сертификатов
-	node1, err := IssueCertificate(caKey, certPEM, dir, "beacon-t1", DefaultCertTTL)
+	node1, err := IssueCertificate(caKey, certPEM, dir, "beacon-t1", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("Issue cert1: %v", err)
 	}
-	node2, err := IssueCertificate(caKey, certPEM, dir, "beacon-t2", DefaultCertTTL)
+	node2, err := IssueCertificate(caKey, certPEM, dir, "beacon-t2", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("Issue cert2: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestTrustStoreRevocation(t *testing.T) {
 	dir := t.TempDir()
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
-	IssueCertificate(caKey, certPEM, dir, "revoke-me", DefaultCertTTL)
+	IssueCertificate(caKey, certPEM, dir, "revoke-me", DefaultCertTTL, RolePeer)
 
 	ts, _ := NewTrustStore(dir+"/ca/ca-cert.pem", dir+"/ca/crl.pem")
 	cert, err := loadCertPEM(dir + "/revoke-me/cert.pem")
@@ -378,7 +378,7 @@ func TestRevocationDoesNotAffectReissuedCert(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL)
+	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("первая выдача: %v", err)
 	}
@@ -390,7 +390,7 @@ func TestRevocationDoesNotAffectReissuedCert(t *testing.T) {
 		t.Fatalf("архивирование: %v", err)
 	}
 
-	second, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL)
+	second, err := IssueCertificate(caKey, certPEM, dir, "beacon-flaky", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("пере-выдача: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestGossipCRLMerge(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	issued, err := IssueCertificate(caKey, certPEM, dir, "gossip-node", DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, certPEM, dir, "gossip-node", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("IssueCertificate: %v", err)
 	}

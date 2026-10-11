@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"sync"
 	"syscall"
 	"time"
@@ -93,7 +92,16 @@ func NewSSHServer(cfg *Config, ts *TrustStore) (*SSHServer, error) {
 }
 
 // authorize проверяет SSH-ключ клиента через TrustStore в реальном времени.
-// Каждое подключение проверяется актуальным состоянием TrustStore (CRL).
+//
+// Три условия, и все три обязательны:
+//
+//  1. Сертификат выпущен для роли server. Клиентские (peer) сертификаты
+//     имеют только ExtKeyUsageClientAuth и SSH-доступа не получают — иначе
+//     компрометация любого узла давала бы root на всех остальных.
+//  2. CN попадает в allowlist (-ssh-allow). Пустой allowlist означает
+//     отказ всем: SSH-доступ выдаётся персонально, а не по факту выдачи
+//     сертификата.
+//  3. Сертификат живой: не отозван и не просрочен.
 func (s *SSHServer) authorize(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 	fp := ssh.FingerprintSHA256(pubKey)
 
@@ -108,36 +116,82 @@ func (s *SSHServer) authorize(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh
 			continue
 		}
 
-		if ssh.FingerprintSHA256(sshPubKey) == fp {
-			// Нашли совпадение — проверяем CRL в реальном времени
-			if s.trustStore.IsRevoked(cert) {
-				log.Printf("[SSH] отклонено: сертификат отозван CN=%s addr=%s",
-					cert.Subject.CommonName, conn.RemoteAddr())
-				return nil, fmt.Errorf("certificate revoked")
-			}
-
-			// Проверяем срок действия
-			if cert.NotAfter.Before(time.Now()) {
-				log.Printf("[SSH] отклонено: сертификат просрочен CN=%s addr=%s",
-					cert.Subject.CommonName, conn.RemoteAddr())
-				return nil, fmt.Errorf("certificate expired")
-			}
-
-			log.Printf("[SSH] авторизован: CN=%s addr=%s fingerprint=%s",
-				cert.Subject.CommonName, conn.RemoteAddr(), fp)
-
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"pubkey-cn": cert.Subject.CommonName,
-					"pubkey-fp": fp,
-				},
-			}, nil
+		if ssh.FingerprintSHA256(sshPubKey) != fp {
+			continue
 		}
+
+		// Нашли совпадение — проверяем, что это серверная роль.
+		if !hasServerRole(cert) {
+			log.Printf("[SSH] отклонено: сертификат CN=%s не роли server (addr=%s)",
+				cert.Subject.CommonName, conn.RemoteAddr())
+			return nil, fmt.Errorf("сертификат не предназначен для SSH (нужна роль server)")
+		}
+
+		// Проверяем allowlist.
+		if !s.allowCN(cert.Subject.CommonName) {
+			log.Printf("[SSH] отклонено: CN=%s не в списке разрешённых (addr=%s)",
+				cert.Subject.CommonName, conn.RemoteAddr())
+			return nil, fmt.Errorf("CN не разрешён для SSH на этом узле")
+		}
+
+		// CRL проверяется в реальном времени — отзыв действует сразу.
+		if s.trustStore.IsRevoked(cert) {
+			log.Printf("[SSH] отклонено: сертификат отозван CN=%s addr=%s",
+				cert.Subject.CommonName, conn.RemoteAddr())
+			return nil, fmt.Errorf("certificate revoked")
+		}
+
+		// Проверяем срок действия
+		if cert.NotAfter.Before(time.Now()) {
+			log.Printf("[SSH] отклонено: сертификат просрочен CN=%s addr=%s",
+				cert.Subject.CommonName, conn.RemoteAddr())
+			return nil, fmt.Errorf("certificate expired")
+		}
+
+		log.Printf("[SSH] авторизован: CN=%s addr=%s fingerprint=%s",
+			cert.Subject.CommonName, conn.RemoteAddr(), fp)
+
+		return &ssh.Permissions{
+			Extensions: map[string]string{
+				"pubkey-cn": cert.Subject.CommonName,
+				"pubkey-fp": fp,
+			},
+		}, nil
 	}
 
 	log.Printf("[SSH] отклонено: ключ не авторизован addr=%s fingerprint=%s",
 		conn.RemoteAddr(), fp)
 	return nil, fmt.Errorf("public key not authorized")
+}
+
+// allowCN проверяет, входит ли CN в разрешающий список.
+//
+// Пустой список — отказ всем. Это осознанно: allowlist заполняется вручную под
+// конкретный узел, поэтому «пусто = можно всем» означало бы обратное тому,
+// ради чего список заводился.
+func (s *SSHServer) allowCN(cn string) bool {
+	for _, allowed := range s.config.SSHAllowCNs {
+		if allowed == cn {
+			return true
+		}
+	}
+
+	// Разрешаем CN самого узла: иначе владелец не сможет зайти на свой же
+	// маячок, пока не добавит себя в список.
+	return cn == s.config.NodeName
+}
+
+// hasServerRole проверяет, что сертификат может работать серверной стороной.
+//
+// Go при handshake требует ExtKeyUsageServerAuth для серверного сертификата,
+// поэтому наличия только ClientAuth недостаточно. Роль server выдаётся явно.
+func hasServerRole(cert *x509.Certificate) bool {
+	for _, usage := range cert.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageServerAuth {
+			return true
+		}
+	}
+	return false
 }
 
 // Start запускает SSH-сервер.
@@ -260,7 +314,16 @@ func (s *SSHServer) handleConnection(netConn net.Conn) {
 }
 
 // handleChannel обрабатывает SSH-канал (session).
+//
+// recover() здесь не паранойя: длина exec-payload проверяется в handleRequests,
+// но любая ошибка разбора приходит от клиента и не должна ронять весь процесс.
 func (s *SSHServer) handleChannel(newChan ssh.NewChannel, conn *ssh.ServerConn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[SSH] паника при обработке канала восстановлена: %v", r)
+		}
+	}()
+
 	channel, requests, err := newChan.Accept()
 	if err != nil {
 		log.Printf("[SSH] channel accept: %v", err)
@@ -312,8 +375,17 @@ func (s *SSHServer) handleRequests(ctx context.Context, reqs <-chan *ssh.Request
 			case "exec":
 				if !shellStarted {
 					shellStarted = true
-					cmd := string(req.Payload[4:]) // пропускаем длину
-					execCmd = cmd
+					// Payload: uint32 длина + сама команда. Без проверки
+					// длины req.Payload[4:] падает на malformed-запросе —
+					// то есть клиент роняет сервер одной битой строкой.
+					if len(req.Payload) < 4 {
+						log.Printf("[SSH] некорректный exec payload от %s: %d байт",
+							channel, len(req.Payload))
+						req.Reply(false, nil)
+						shellStarted = false
+						continue
+					}
+					execCmd = string(req.Payload[4:])
 					go s.startShell(ctx, channel, ptyReq, execCmd, cancel)
 				}
 				req.Reply(true, nil)
@@ -355,10 +427,21 @@ type ptyRequest struct {
 func (s *SSHServer) startShell(ctx context.Context, ch ssh.Channel, pty *ptyRequest, execCmd string, cancel context.CancelFunc) {
 	defer cancel()
 
-	// Определяем shell
-	shell := "/bin/sh"
-	if _, err := os.Stat("/bin/bash"); err == nil {
-		shell = "/bin/bash"
+	// Ограничение по whitelist команд. При заданном -ssh-allow-commands
+	// работают только эти команды, а интерактивный shell запрещён: иначе
+	// обход whitelist был бы тривиальным.
+	if execCmd != "" && !s.allowCommand(execCmd) {
+		fmt.Fprintf(ch, "команда не разрешена политикой -ssh-allow-commands\r\n")
+		return
+	}
+	if execCmd == "" && !s.config.SSHInteractive {
+		fmt.Fprintf(ch, "интерактивный shell запрещён на этом узле\r\n")
+		return
+	}
+
+	shell := s.config.SSHShell
+	if shell == "" {
+		shell = "/bin/sh"
 	}
 
 	var cmd *exec.Cmd
@@ -408,15 +491,6 @@ func (s *SSHServer) startShell(ctx context.Context, ch ssh.Channel, pty *ptyRequ
 		done <- cmd.Wait()
 	}()
 
-	// Обработка SIGWINCH для resize
-	sigWinch := make(chan os.Signal, 1)
-	signal.Notify(sigWinch, syscall.SIGWINCH)
-	defer signal.Stop(sigWinch)
-
-	// Периодическая проверка resize через запросы
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -437,31 +511,57 @@ func (s *SSHServer) startShell(ctx context.Context, ch ssh.Channel, pty *ptyRequ
 			exitPayload[3] = byte(exitCode)
 			ch.SendRequest("exit-status", false, exitPayload)
 			return
-		case <-ticker.C:
-			// Периодическая проверка — если канал закрыт, выходим
-			if ch_err := ch.CloseWrite(); ch_err != nil {
-				// Канал уже закрыт
-			}
 		}
 	}
 }
 
-// idleWatcher отключает соединение при неактивности.
-func (s *SSHServer) idleWatcher(ctx context.Context, ch ssh.Channel) {
-	timer := time.NewTimer(s.idleTimeout)
-	defer timer.Stop()
+// allowCommand проверяет, разрешена ли exec-команда политикой -ssh-allow-commands.
+//
+// Сравнение точное: подстрока означала бы, что "uname -a" разрешает
+// "uname -a; rm -rf /". Пустой список разрешает всё: whitelist включается
+// только когда задан явно.
+func (s *SSHServer) allowCommand(cmd string) bool {
+	if len(s.config.SSHAllowCommands) == 0 {
+		return true
+	}
 
-	// Мониторим активность через Read
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			log.Printf("[SSH] idle timeout, отключение")
-			ch.Close()
-			return
+	for _, allowed := range s.config.SSHAllowCommands {
+		if allowed == cmd {
+			return true
 		}
 	}
+	return false
+}
+
+// idleWatcher закрывает канал, когда активности не было idleTimeout.
+//
+// Возвращает канал, по которому сбрасывается таймер. Раньше таймер ставился
+// один раз и ResetIdle нигде не вызывался — сессия умирала ровно через 10
+// минут, даже если пользователь активно печатал.
+func (s *SSHServer) idleWatcher(ctx context.Context, ch ssh.Channel) chan<- struct{} {
+	timer := time.NewTimer(s.idleTimeout)
+	reset := make(chan struct{}, 1)
+
+	go func() {
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				log.Printf("[SSH] idle timeout, отключение")
+				ch.Close()
+				return
+			case <-reset:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(s.idleTimeout)
+			}
+		}
+	}()
+
+	return reset
 }
 
 // ResetIdle сбрасывает таймер неактивности.

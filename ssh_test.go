@@ -104,6 +104,12 @@ func testCertSetup(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certifica
 		SSHIdleTimeout: time.Minute,
 		DataDir:        dir,
 		NodeName:       "beacon-test",
+		SSHShell:       "/bin/sh",
+		SSHInteractive: true,
+		// Разрешаем CN тестового сертификата: пустой allowlist означает
+		// «никто», и авторизация падала бы корректно, но не по той причине,
+		// которую проверяют эти тесты.
+		SSHAllowCNs: []string{cn},
 	}
 
 	return cfg, ts

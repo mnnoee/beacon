@@ -30,7 +30,7 @@ func TestCAIndexRejectsDuplicateCN(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-nas", DefaultCertTTL)
+	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-nas", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("первая выдача: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestReissueChangesSerialAndNodeID(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-router", DefaultCertTTL)
+	first, err := IssueCertificate(caKey, certPEM, dir, "beacon-router", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("первая выдача: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestReissueChangesSerialAndNodeID(t *testing.T) {
 		t.Fatalf("ArchiveCertIfPresent: %v", err)
 	}
 
-	second, err := IssueCertificate(caKey, certPEM, dir, "beacon-router", DefaultCertTTL)
+	second, err := IssueCertificate(caKey, certPEM, dir, "beacon-router", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("пере-выдача: %v", err)
 	}
@@ -168,8 +168,8 @@ func TestRevokeBySerialLookup(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	a, _ := IssueCertificate(caKey, certPEM, dir, "beacon-a", DefaultCertTTL)
-	b, _ := IssueCertificate(caKey, certPEM, dir, "beacon-b", DefaultCertTTL)
+	a, _ := IssueCertificate(caKey, certPEM, dir, "beacon-a", DefaultCertTTL, RolePeer)
+	b, _ := IssueCertificate(caKey, certPEM, dir, "beacon-b", DefaultCertTTL, RolePeer)
 
 	found, err := findCertBySerial(dir, a.Serial)
 	if err != nil {
@@ -322,7 +322,7 @@ func TestBeaconsDirectoryLayout(t *testing.T) {
 	_, certPEM, _ := GenerateCA(dir, DefaultCALifetime)
 	caKey, _ := LoadCAKey(dir + "/ca/ca-key.pem")
 
-	issued, err := IssueCertificate(caKey, certPEM, dir, "beacon-layout", DefaultCertTTL)
+	issued, err := IssueCertificate(caKey, certPEM, dir, "beacon-layout", DefaultCertTTL, RolePeer)
 	if err != nil {
 		t.Fatalf("IssueCertificate: %v", err)
 	}
