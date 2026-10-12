@@ -1,6 +1,11 @@
 # Network Beacons (Сетевые Маячки)
 
-Распределенная система обнаружения устройств в LAN с SSH-доступом, защищенной P2P-сетью и TUI-монитором.
+Распределённая система обнаружения устройств в LAN: узлы находят друг друга по
+broadcast, аутентифицируются взаимным TLS с общим CA, обмениваются CRL и
+раздают SSH-доступ по allowlist.
+
+Документ описывает **фактическое** поведение. Расхождения с этим текстом —
+ошибка в коде или здесь.
 
 ## Обзор
 
@@ -8,9 +13,9 @@
 
 | Режим | Команда | Назначение |
 |-------|---------|-----------|
-| CA | `beacon ca` | Генерация CA, выдача/отзыв сертификатов |
-| Beacon | `beacon beacon` | Discovery, mTLS, SSH, gossip |
-| SSH | `beacon ssh` | Подключение к другому маячку |
+| CA | `beacon ca` | Генерация CA, выдача и отзыв сертификатов |
+| Beacon | `beacon beacon` | Discovery, mTLS, gossip, SSH-сервер, TUI |
+| SSH | `beacon ssh` | Подключение к соседнему маячку по имени или адресу |
 | Monitor | `beacon monitor` | TUI-монитор состояния сети |
 
 ## Архитектура
@@ -21,102 +26,185 @@
 │  • Генерация Root CA (ECDSA P-256)                  │
 │  • Выдача сертификатов (provision-beacon)            │
 │  • Отзыв сертификатов (CRL)                         │
-│  • Экспорт/синхронизация (export-ca, sync-crl)      │
+│  • Синхронизация CRL (sync-crl)                      │
 └──────────────────────┬──────────────────────────────┘
-                       │ provisioning (USB/файл)
+                       │ provisioning: файлы ключа и сертификата
            ┌───────────┴───────────┐
            ▼                       ▼
-┌──────────────────┐    ┌──────────────────┐
-│  Beacon Node 1   │◄──►│  Beacon Node 2   │
-│                  │    │                  │
-│ • UDP Discovery  │    │ • UDP Discovery  │
-│ • mTLS P2P       │    │ • mTLS P2P       │
-│ • SSH Server     │    │ • SSH Server     │
-│ • Gossip CRL     │    │ • Gossip CRL     │
-│ • TUI Monitor    │    │ • TUI Monitor    │
-└──────────────────┘    └──────────────────┘
+ ┌──────────────────┐    ┌──────────────────┐
+ │  Beacon Node 1   │◄──►│  Beacon Node 2   │
+ │ • UDP broadcast  │    │ • UDP broadcast  │
+ │ • mTLS P2P       │    │ • mTLS P2P       │
+ │ • cert-share     │    │ • cert-share     │
+ │ • gossip CRL     │    │ • gossip CRL     │
+ │ • SSH-сервер     │    │ • SSH-сервер     │
+ │ • state.json     │    │ • state.json     │
+ └──────────────────┘    └──────────────────┘
 ```
 
 ### Стек
 
 | Компонент | Технология |
 |-----------|-----------|
-| Discovery | UDP broadcast (255.255.255.255), Ed25519-подписи |
-| Транспорт | Mutual TLS (ECDSA P-256) |
+| Discovery | UDP broadcast, Ed25519-подпись каждого пакета |
+| Транспорт | Mutual TLS (ECDSA P-256), обязательный клиентский сертификат |
+| Обмен сертификатами | `PktCertShare` поверх уже установленного mTLS |
 | SSH | golang.org/x/crypto/ssh |
-| TUI | bubbletea + lipgloss + go-runewidth |
-| Шифрование ключей | AES-256-GCM + PBKDF2 (600K итераций) |
-| Trust Store | CA + CRL + gossip |
-| Rate Limiting | Token bucket (per IP) |
+| TUI | bubbletea + lipgloss |
+| Шифрование ключей | AES-256-GCM, ключ из PBKDF2-HMAC-SHA256 (600K итераций) |
+| Отзывы | CRL на `crypto/x509` + gossip по mTLS |
+| Rate limiting | Token bucket (per IP) |
+
+### Как соседи узнают друг о друге
+
+1. **Discovery.** Узел рассылает `PktAnnounce` в broadcast подсети каждые 5 с.
+   Пакет подписан Ed25519-ключом узла, публичная часть которого лежит в его
+   сертификате (SAN URI `urn:beacon:ed25519:…`).
+2. **mTLS.** Увидевший узел дозванивается до соседа по TCP. Сертификат соседа
+   проверяется по CA и CRL; сверяется, что `nodeID` из сертификата совпадает с
+   идентификатором из discovery.
+3. **Cert-share.** По установленному каналу каждый отдаёт свой сертификат.
+   Сосед проверяет его по CA и CRL, сверяет CN с ключом и кладёт в
+   `<dataDir>/peers/<cn>.cert.pem`. Конфликт CN с чужим ключом — отказ с
+   громким логом, а не «победил первый».
+4. **Gossip.** Отзывы расходятся по тем же mTLS-каналам: подпись пакета
+   проверяется ключом из сертификата отправителя, а сам отправитель обязан быть
+   тем, кто открыл канал.
+
+Обмен ключами по сети не происходит: закрытый ключ CA передаётся на узел
+файлом (USB, scp). Это TOFU по модели распространения.
+
+### Идентичность узла
+
+`nodeID = sha256(Ed25519-публичный ключ)[:16]`, ключ берётся из SAN
+сертификата. Один и тот же расчёт делают все стороны, поэтому идентификатор,
+объявленный по UDP, совпадает с тем, что предъявлен в TLS и SSH.
+
+Прежняя схема (NodeID = первые 16 байт ключа, SubjectKeyId = случайные 16
+байт от CA) давала пиру два разных ID и две записи в карте пиров.
+
+### Роли сертификатов
+
+| Роль | `-role` | Что может |
+|------|---------|-----------|
+| `peer` | по умолчанию | участвовать в сети: discovery, mTLS-клиент, gossip |
+| `server` | `-role server` | то же + работать сервером mTLS и SSH |
+
+SSH-доступ получают **только** сертификаты роли `server`: компрометация
+любого узла сети не должна давать shell на всех остальных.
 
 ### Безопасность
 
 | Угроза | Защита |
 |--------|--------|
-| UDP Spoofing | Discovery — только «анонс». Реальное общение — после mTLS. |
-| Replay Attacks | Nonce (32 Б) + timestamp (±5 мин). |
-| MITM | Взаимная аутентификация через общий CA. |
-| Key Compromise | CRL через gossip. Отзыв через `revoke-beacon`. |
-| Broadcast Storms | Token-bucket rate limiter (2 pkt/s, burst 10). |
-| Ключи на диске | AES-256-GCM + PBKDF2. Права 0600. |
-| SSH brute-force | Только public key auth, лимит 10 подключений. |
-| SSH host key | Проверка через TrustStore (не InsecureIgnoreHostKey). |
+| Подмена announce | Пакет подписывается ключом из сертификата; NodeID обязан соответствовать ключу |
+| Replay | 32-байтный nonce с TTL 300 с; окно времени ±5 мин симметрично |
+| MITM | Взаимная аутентификация mTLS; проверка сертификата по CA и CRL |
+| Отзыв узла | CRL + gossip; узел без ключа CA хранит отзывы в `ca/revoked-cache.json` |
+| Подмена CN в cert-share | Конфликт CN с другим ключом — отказ, а не перезапись |
+| Подмена адреса в discovery | Ответ проверяется подписью ключом из сертификата целевого узла |
+| Клон узла | Два адреса на один NodeID — отказ со списком кандидатов |
+| Отравнение CRL | Подпись списка проверяется ключом CA до принятия записей |
+| Flood по UDP | Token bucket: 2 пакета/с на IP, burst 10 |
+| SSH без политики | SSH **выключен** по умолчанию; при `-ssh` пустой allowlist = отказ всем |
+| Ключи на диске | Права 0600; AES-256-GCM при заданном секрете (см. ниже) |
 
-### Discovery
+### Discovery: формат пакета
 
-UDP broadcast на порт 1984. Multicast (239.19.84.1) поддерживается, но не работает через WiFi-роутеры — по умолчанию broadcast.
+Версия протокола — **2**. Announce и Echo несут публичный ключ Ed25519
+отправителя, иначе подпись нечем было бы проверить. Пакеты версии 1
+отбрасываются как невалидные.
 
 ```
 ┌────────┬─────────┬──────┬────────┬───────────┬───────┬─────────┬──────────┐
 │ Magic  │ Version │ Type │ NodeID │ Timestamp │ Nonce │ Payload │ Signature│
-│ 4 byte │ 1 byte  │ 1 B  │ 16 B   │ 8 B       │ 32 B  │ var     │ 64 B     │
+│ 4 byte │ 1 byte  │ 1 B  │ 16 B   │ 8 B       │ 32 B  │ 32 B    │ 64 B     │
 └────────┴─────────┴──────┴────────┴───────────┴───────┴─────────┴──────────┘
 ```
 
-### Dual CA
+Подпись покрывает все байты до себя.
 
-Два узла могут работать как CA одновременно:
+| Тип | Значение | Куда идёт |
+|-----|----------|-----------|
+| Announce | 0x01 | broadcast, «я здесь» |
+| Echo | 0x02 | unicast в ответ на announce |
+| Gossip | 0x03 | только по mTLS, не по UDP |
+| CertShare | 0x04 | только по mTLS |
+
+Обнаружение работает **только** через broadcast. Multicast-код был удалён:
+он никогда не включался, а `joinMulticastGroup` собирал структуру подписки и не
+передавал её ядру — оставить его значило оставить ловушку.
+
+### Секрет шифрования ключей
+
+Приватные ключи по умолчанию лежат открытым PEM с правами 0600. Секрет
+задаётся явно:
+
 ```bash
-# На первой машине
-beacon ca generate-ca -dir ./data
-beacon ca export-ca -dir ./data
+export BEACON_PASSPHRASE='...'                 # или -passphrase-file <файл>
+beacon ca generate-ca -dir ./data              # ключ CA сразу зашифрован
+```
 
-# На второй машине
-scp user@first:~/data/ca/* ~/beacon-data/ca/
+Ключи, выпущенные ранее, перешифровываются при первом чтении с секретом. Без
+секрета `generate-ca` прямо предупреждает, что ключ лежит открытым.
+
+### Вторая CA-машина
+
+Копировать `ca-key.pem` на второй узел нельзя: компрометация одного ключа
+компрометирует всю сеть. Если второй машине нужен только CRL:
+
+```bash
+scp user@first:~/data/ca/ca-cert.pem ~/beacon-data/ca/
+scp user@first:~/data/ca/crl.pem        ~/beacon-data/ca/
 beacon ca list-trusted -dir ~/beacon-data
 ```
 
-CRL синхронизируется через `sync-crl` или gossip-протокол.
+Если нужна вторая CA-машина, она генерирует **свой** CA, а маячки импортируют
+оба сертификата (`import-ca`) и получают отзывы через gossip или `sync-crl`.
 
 ## Структура файлов
 
 ```
 beacon/
-├── main.go          # CLI: ca / beacon / ssh / monitor
-├── config.go        # Конфигурация, порты, дефолты
-├── ca.go            # CA, выдача сертификатов, CRL
-├── keys.go          # Ed25519/ECDSA, PBKDF2, AES-GCM
-├── truststore.go    # Trust Store, CRL, gossip, Ed25519 keys
-├── protocol.go      # Wire format discovery-пакетов
-├── ratelimit.go     # Token bucket rate limiter
-├── discovery.go     # UDP broadcast с fallback multicast
-├── transport.go     # Mutual TLS (VerifyPeerCertificate)
-├── ssh_server.go    # SSH-сервер (PTY, exec, TrustStore auth)
-├── ssh_client.go    # SSH-клиент (host key verification)
-├── beacon.go        # Основная логика маячка
-├── monitor.go       # TUI (bubbletea + lipgloss)
-├── beacon_test.go   # Тесты PKI/mTLS/protocol
-├── ssh_test.go      # Тесты SSH
-└── docs/
-    ├── README.md    # Этот файл
-    └── USAGE.md     # Руководство по использованию
+├── main.go            CLI: ca / beacon / ssh / monitor
+├── config.go          конфигурация, порты, дефолты
+├── identity.go        nodeID из Ed25519-ключа, SAN URI
+├── ca.go              генерация CA, выдача и отзыв сертификатов
+├── caindex.go         индекс выданных сертификатов (ca/index.json)
+├── crl.go             CRL на crypto/x509, конверт старого формата, кэш
+├── certshare.go       обмен сертификатами по mTLS
+├── keys.go            PBKDF2/AES-GCM, разбор PEM
+├── keyfile.go         шифрование ключей на диске, миграция
+├── truststore.go      CA-пул, CRL, ключи подписей, host key, поиск по CN
+├── protocol.go        wire-формат пакетов
+├── ratelimit.go       token bucket
+├── discovery.go       UDP broadcast, проверка подписи, echo
+├── transport.go       mutual TLS
+├── beacon.go          жизненный цикл узла, пиры, gossip
+├── ssh_server.go      SSH-сервер: роли, allowlist, exec, idle
+├── ssh_client.go      SSH-клиент: разрешение имени, проверка host key
+├── state.go           state.json для отдельного процесса монитора
+├── monitor.go         TUI (bubbletea + lipgloss)
+├── docs/
+│   ├── README.md      этот файл
+│   ├── USAGE.md       команды и флаги
+│   ├── ROADMAP.md     план работ и статус фаз
+│   └── HANDOFF.md     состояние проекта на паузе
+└── .github/workflows/ci.yml
 ```
 
 ## Известные ограничения
 
-1. **Физический доступ к CA** — кража ключа = компрометация сети.
-2. **Синхронизация часов** — timestamp ±5 минут. NTP обязателен.
-3. **Нет DNS** — подключение по IP, CN как логический ID.
-4. **TOFU** — ключи передаются через USB/файл при начальной настройке.
-5. **Одна подсеть** — discovery в пределах broadcast-домена.
-6. **WiFi multicast** — не работает через роутеры, используется broadcast.
+1. **Ключ CA — единая точка отказа.** Утрата = нельзя выдавать новые
+   сертификаты; компрометация = вся сеть под контролем злоумышленника.
+2. **Одна подсеть.** Обнаружение живёт в пределах broadcast-домена; между
+   подсетями нужен внешний узел.
+3. **TOFU.** Канал mTLS открывается по факту предъявления сертификата,
+   подписанного нашим CA; первое соединение с узлом — доверие к выдавшему CA.
+4. **Часы узлов.** Окно ±5 минут. При большем расхождении пакеты
+   отбрасываются.
+5. **window-change не пробрасывается.** Интерактивная сессия получает PTY, но
+   изменение размера окна не доходит до процесса: для этого нужна отдельная
+   работа с pty-библиотекой.
+6. **Отзыв требует CRL.** Узел без ключа CA принимает отзывы по gossip и
+   хранит их в кэше; подписанный CRL он не формирует.
