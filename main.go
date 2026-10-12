@@ -109,8 +109,15 @@ func cmdSSH(args []string) {
 	// иначе broadcast-запрос уйдёт мимо, и имя не разрешится в адрес.
 	discPort := fs.Int("disc-port", DefaultDiscoveryPort, "UDP-порт discovery (как у маячков)")
 	broadcastAddr := fs.String("broadcast", "255.255.255.255", "broadcast-адрес сети")
+	passphraseFile := fs.String("passphrase-file", "",
+		"файл с секретом для шифрования ключей на диске (иначе "+passphraseEnvVar+")")
 
 	fs.Parse(args)
+
+	if err := applyPassphrase(*passphraseFile); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	target := fs.Arg(0)
 	execCmd := fs.Arg(1) // может быть пустым
@@ -182,6 +189,21 @@ func cmdMonitor(args []string) {
 	}
 }
 
+// applyPassphrase разрешает секрет шифрования ключей и задаёт его глобально.
+//
+// Флаг важнее переменной окружения: секрет в окружении виден через /proc и
+// попадает в окружение дочерних процессов, файл — нет.
+func applyPassphrase(file string) error {
+	secret, err := resolvePassphrase(file)
+	if err != nil {
+		return err
+	}
+
+	SetPassphrase(secret)
+
+	return nil
+}
+
 // cmdCA обрабатывает команды Главной Ноды (CA).
 func cmdCA(args []string) {
 	if len(args) == 0 {
@@ -199,8 +221,18 @@ func cmdCA(args []string) {
 	serialArg := fs.String("serial", "", "серийный номер сертификата (для revoke-beacon)")
 	nodeName := fs.String("node", "", "имя узла (для revoke-beacon)")
 	role := fs.String("role", "peer", "роль сертификата: peer (участие в сети) или server (плюс SSH)")
+	passphraseFile := fs.String("passphrase-file", "",
+		"файл с секретом для шифрования ключей на диске (иначе "+passphraseEnvVar+")")
 
 	fs.Parse(args[1:])
+
+	// Секрет задаётся до любой операции с ключами: и запись (generate-ca,
+	// provision-beacon), и чтение (revoke-beacon, list-trusted) идут через
+	// один и тот же путь.
+	if err := applyPassphrase(*passphraseFile); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	// Автоопределение путей
 	if *caKeyPath == "" {
@@ -283,8 +315,21 @@ func cmdGenerateCA(dataDir, caKeyPath, caCertPath string) {
 	}
 
 	fmt.Println("CA успешно сгенерирован:")
-	fmt.Printf("  Ключ:    %s (права 0600)\n", caKeyPath)
+	if Passphrase() != "" {
+		fmt.Printf("  Ключ:    %s (зашифрован, права 0600)\n", caKeyPath)
+	} else {
+		fmt.Printf("  Ключ:    %s (права 0600, БЕЗ шифрования)\n", caKeyPath)
+	}
 	fmt.Printf("  Сертификат: %s\n", caCertPath)
+
+	if Passphrase() == "" {
+		fmt.Println()
+		fmt.Println("ВНИМАНИЕ: ключ CA сохранён без шифрования.")
+		fmt.Printf("Чтобы он шифровался, задайте секрет: %s=\"...\" или -passphrase-file <файл>.\n",
+			passphraseEnvVar)
+		fmt.Println("Существующий открытый ключ будет перешифрован при первом чтении с секретом.")
+	}
+
 	fmt.Println()
 	fmt.Println("ВАЖНО: бэкапите ключ CA в безопасном месте!")
 	fmt.Println("При его утрате вы не сможете выдавать новые сертификаты.")
@@ -749,8 +794,15 @@ func cmdBeacon(args []string) {
 	sshAllow := fs.String("ssh-allow", "", "CN, которым разрешён вход (через запятую)")
 	sshAllowCommands := fs.String("ssh-allow-commands", "", "разрешённые exec-команды (через запятую)")
 	sshShell := fs.String("ssh-shell", cfg.SSHShell, "интерпретатор для SSH-сессий")
+	passphraseFile := fs.String("passphrase-file", "",
+		"файл с секретом для шифрования ключей на диске (иначе "+passphraseEnvVar+")")
 
 	fs.Parse(args)
+
+	if err := applyPassphrase(*passphraseFile); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	if idleTimeout > 0 {
 		cfg.SSHIdleTimeout = idleTimeout

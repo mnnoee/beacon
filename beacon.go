@@ -95,18 +95,25 @@ func NewBeaconNode(cfg *Config) (*BeaconNode, error) {
 func (b *BeaconNode) loadOrCreateEdKey() error {
 	keyPath := b.config.Ed25519KeyPath()
 
-	data, err := ReadFileContents(keyPath)
-	if err != nil {
+	// Отсутствие файла — ошибка конфигурации, а не повод сгенерировать ключ:
+	// ключ выдаётся вместе с сертификатом, и его публичная часть записана в SAN.
+	if _, err := os.Stat(keyPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("не найден Ed25519-ключ %s: выдайте сертификат заново командой "+
+				"'beacon ca provision-beacon -reissue %s' — ключ выдаётся вместе с сертификатом, "+
+				"а его публичная часть записывается в SAN", keyPath, b.config.NodeName)
+		}
 		return fmt.Errorf("чтение Ed25519 ключа: %w", err)
 	}
 
-	if data == nil {
-		return fmt.Errorf("не найден Ed25519-ключ %s: выдайте сертификат заново командой "+
-			"'beacon ca provision-beacon -reissue %s' — ключ выдаётся вместе с сертификатом, "+
-			"а его публичная часть записывается в SAN", keyPath, b.config.NodeName)
+	// Ключ может быть зашифрован блоком ENCRYPTED BEACON KEY: тогда нужен
+	// секрет (см. -passphrase-file / BEACON_PASSPHRASE).
+	edDER, err := LoadPrivateKeyFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("загрузка Ed25519 ключа %s: %w", keyPath, err)
 	}
 
-	edKey, err := DeserializePrivateKeyPEM(data)
+	edKey, err := parseEd25519PrivateKey(edDER)
 	if err != nil {
 		return fmt.Errorf("разбор Ed25519 ключа %s: %w", keyPath, err)
 	}

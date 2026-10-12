@@ -12,6 +12,40 @@ import (
 	"os"
 )
 
+// LoadNodeCertificate загружает сертификат узла вместе с приватным ключом.
+//
+// Отдельная загрузка вместо tls.LoadX509KeyPair: ключ может лежать в блоке
+// ENCRYPTED BEACON KEY, а стандартный загрузчик такой блок не понимает и
+// отвергает файл целиком. Здесь ключ сначала расшифровывается, а сертификат
+// разбирается обычным способом.
+func LoadNodeCertificate(certPath, keyPath string) (tls.Certificate, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("чтение сертификата узла: %w", err)
+	}
+
+	certBlock, _ := pem.Decode(certPEM)
+	if certBlock == nil {
+		return tls.Certificate{}, fmt.Errorf("не удалось декодировать сертификат узла %s", certPath)
+	}
+
+	cert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("парсинг сертификата узла: %w", err)
+	}
+
+	key, err := LoadECDSAKey(keyPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("загрузка приватного ключа узла: %w", err)
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{certBlock.Bytes},
+		PrivateKey:  key,
+		Leaf:        cert,
+	}, nil
+}
+
 // TLSConfigForNode создаёт tls.Config для TLS-соединений.
 //
 // Использует взаимную аутентификацию (Mutual TLS):
@@ -19,9 +53,9 @@ import (
 // - Сертификат клиента проверяется сервером через ClientCAs (наш CA)
 // - Обе стороны используют сертификаты, подписанные общим CA
 func TLSConfigForNode(certPath, keyPath, caCertPath string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	cert, err := LoadNodeCertificate(certPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("загрузка TLS-сертификата: %w", err)
+		return nil, err
 	}
 
 	caCertPEM, err := os.ReadFile(caCertPath)
@@ -115,17 +149,14 @@ func TLSClientDial(addr string, config *tls.Config) (*tls.Conn, error) {
 	return conn, nil
 }
 
-// LoadECDSAKey загружает ECDSA приватный ключ из PEM.
+// LoadECDSAKey загружает ECDSA приватный ключ из PEM (в том числе зашифрованный).
 func LoadECDSAKey(path string) (*ecdsa.PrivateKey, error) {
-	data, err := os.ReadFile(path)
+	der, err := LoadPrivateKeyFile(path)
 	if err != nil {
 		return nil, err
 	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM")
-	}
-	key, err := x509.ParseECPrivateKey(block.Bytes)
+
+	key, err := x509.ParseECPrivateKey(der)
 	if err != nil {
 		return nil, fmt.Errorf("парсинг ключа: %w", err)
 	}

@@ -572,19 +572,14 @@ func (s *SSHServer) ResetIdle(timer *time.Timer) {
 
 // === Вспомогательные функции ===
 
-// loadHostKey загружает ECDSA приватный ключ из PEM.
+// loadHostKey загружает ECDSA приватный ключ из PEM (в том числе зашифрованный).
 func loadHostKey(path string) (*ecdsa.PrivateKey, error) {
-	data, err := os.ReadFile(path)
+	der, err := LoadPrivateKeyFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM")
-	}
-
-	key, err := x509.ParseECPrivateKey(block.Bytes)
+	key, err := x509.ParseECPrivateKey(der)
 	if err != nil {
 		return nil, fmt.Errorf("парсинг ECDSA ключа: %w", err)
 	}
@@ -711,20 +706,18 @@ func parseSignal(payload []byte) string {
 
 // createSSHCertSigner создаёт SSH signer из ECDSA ключа и сертификата.
 // Используется клиентом для авторизации.
+//
+// Ключ читается через LoadPrivateKeyFile: файл может быть зашифрован блоком
+// ENCRYPTED BEACON KEY, и тогда нужен секрет (см. -passphrase-file).
 func createSSHCertSigner(keyPath, certPath string) (ssh.Signer, error) {
-	keyData, err := os.ReadFile(keyPath)
+	keyDER, err := LoadPrivateKeyFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("чтение ключа: %w", err)
 	}
 
-	keyBlock, _ := pem.Decode(keyData)
-	if keyBlock == nil {
-		return nil, fmt.Errorf("невалидный PEM ключа")
-	}
-
-	parsedKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	parsedKey, err := x509.ParsePKCS8PrivateKey(keyDER)
 	if err != nil {
-		ecKey, err2 := x509.ParseECPrivateKey(keyBlock.Bytes)
+		ecKey, err2 := x509.ParseECPrivateKey(keyDER)
 		if err2 != nil {
 			return nil, fmt.Errorf("парсинг ключа: %w", err)
 		}

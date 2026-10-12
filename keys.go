@@ -131,6 +131,15 @@ func DecryptKey(encryptedData []byte, passphrase string) ([]byte, error) {
 	return plaintext, nil
 }
 
+// Типы PEM-блоков приватных ключей.
+//
+// При заданном секрете вместо них на диск ложится блок ENCRYPTED BEACON KEY,
+// поэтому чтение идёт через LoadPrivateKeyFile, а не напрямую через pem.Decode.
+const (
+	ecPrivateKeyPEMType = "EC PRIVATE KEY"
+	privateKeyPEMType   = "PRIVATE KEY"
+)
+
 // SerializePublicKeyPEM кодирует публичный ключ в PEM-формат.
 func SerializePublicKeyPEM(pub ed25519.PublicKey) []byte {
 	der, err := x509.MarshalPKIXPublicKey(pub)
@@ -153,6 +162,21 @@ func SerializePrivateKeyPEM(priv ed25519.PrivateKey) ([]byte, error) {
 		Type:  "PRIVATE KEY",
 		Bytes: der,
 	}), nil
+}
+
+// parseEd25519PrivateKey разбирает DER Ed25519-приватного ключа.
+func parseEd25519PrivateKey(der []byte) (ed25519.PrivateKey, error) {
+	key, err := x509.ParsePKCS8PrivateKey(der)
+	if err != nil {
+		return nil, fmt.Errorf("парсинг приватного ключа: %w", err)
+	}
+
+	edKey, ok := key.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("ключ не Ed25519 (тип %T)", key)
+	}
+
+	return edKey, nil
 }
 
 // DeserializePrivateKeyPEM раскодирует приватный ключ из PEM.

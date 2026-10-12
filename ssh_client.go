@@ -4,7 +4,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"log"
 	"net"
@@ -412,16 +411,16 @@ func (c *SSHClient) sendBroadcastDiscovery(conn *net.UDPConn, edPriv ed25519.Pri
 }
 
 // loadEd25519Key загружает Ed25519 приватный ключ из PEM-файла.
+//
+// Файл может быть зашифрован блоком ENCRYPTED BEACON KEY — тогда нужен секрет
+// (см. LoadPrivateKeyFile).
 func loadEd25519Key(path string) (ed25519.PrivateKey, error) {
-	data, err := ReadFileContents(path)
+	der, err := LoadPrivateKeyFile(path)
 	if err != nil {
 		return nil, err
 	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("невалидный PEM")
-	}
-	parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+
+	parsedKey, err := x509.ParsePKCS8PrivateKey(der)
 	if err != nil {
 		return nil, err
 	}

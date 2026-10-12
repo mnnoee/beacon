@@ -80,18 +80,14 @@ func GenerateCA(dataDir string, lifetime time.Duration) (*ecdsa.PrivateKey, []by
 		return nil, nil, fmt.Errorf("маршализация ключа CA: %w", err)
 	}
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: keyDER,
-	})
-
 	caDir := filepath.Join(dataDir, "ca")
 	if err := os.MkdirAll(caDir, 0700); err != nil {
 		return nil, nil, fmt.Errorf("создание директории CA: %w", err)
 	}
 
-	// Ключ CA — самый ценный актив системы. Храним с правами 0600.
-	if err := os.WriteFile(filepath.Join(caDir, "ca-key.pem"), keyPEM, 0600); err != nil {
+	// Ключ CA — самый ценный актив системы. Храним с правами 0600 и, если задан
+	// секрет, в зашифрованном виде.
+	if err := SavePrivateKeyFile(filepath.Join(caDir, "ca-key.pem"), ecPrivateKeyPEMType, keyDER); err != nil {
 		return nil, nil, fmt.Errorf("сохранение ключа CA: %w", err)
 	}
 
@@ -272,12 +268,7 @@ func IssueCertificate(
 		return nil, fmt.Errorf("маршализация ключа: %w", err)
 	}
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: keyDER,
-	})
-
-	edPrivPEM, err := SerializePrivateKeyPEM(edPriv)
+	edPrivDER, err := x509.MarshalPKCS8PrivateKey(edPriv)
 	if err != nil {
 		return nil, fmt.Errorf("маршализация Ed25519-ключа: %w", err)
 	}
@@ -292,12 +283,13 @@ func IssueCertificate(
 	certPath := filepath.Join(nodeDir, "cert.pem")
 	edPath := filepath.Join(nodeDir, ed25519KeyFile)
 
-	// Приватные ключи — 0600, сертификат публичный — 0644.
-	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+	// Приватные ключи — 0600 и, при заданном секрете, зашифрованные.
+	// Сертификат публичный — 0644.
+	if err := SavePrivateKeyFile(keyPath, ecPrivateKeyPEMType, keyDER); err != nil {
 		return nil, fmt.Errorf("сохранение ключа узла: %w", err)
 	}
 
-	if err := os.WriteFile(edPath, edPrivPEM, 0600); err != nil {
+	if err := SavePrivateKeyFile(edPath, privateKeyPEMType, edPrivDER); err != nil {
 		return nil, fmt.Errorf("сохранение Ed25519-ключа: %w", err)
 	}
 
@@ -325,18 +317,17 @@ func ParseCertificatePEM(data []byte) (*x509.Certificate, error) {
 }
 
 // LoadCAKey загружает приватный ключ CA из PEM-файла.
+//
+// Файл может быть зашифрован (блок ENCRYPTED BEACON KEY): тогда нужен секрет
+// из -passphrase-file или переменной BEACON_PASSPHRASE. Открытый ключ при
+// заданном секрете перешифровывается на месте.
 func LoadCAKey(path string) (*ecdsa.PrivateKey, error) {
-	data, err := os.ReadFile(path)
+	der, err := LoadPrivateKeyFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("чтение ключа CA: %w", err)
+		return nil, fmt.Errorf("ключ CA: %w", err)
 	}
 
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM-блок ключа CA")
-	}
-
-	key, err := x509.ParseECPrivateKey(block.Bytes)
+	key, err := x509.ParseECPrivateKey(der)
 	if err != nil {
 		return nil, fmt.Errorf("парсинг ключа CA: %w", err)
 	}
