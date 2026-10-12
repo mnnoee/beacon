@@ -125,7 +125,7 @@ func DeserializePacket(data []byte) (*DiscoveryPacket, error) {
 	}
 
 	pktType := data[5]
-	if pktType < PktAnnounce || pktType > PktGossip {
+	if pktType < PktAnnounce || pktType > PktCertShare {
 		return nil, fmt.Errorf("неизвестный тип пакета: %d", pktType)
 	}
 

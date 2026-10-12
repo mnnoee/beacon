@@ -81,8 +81,53 @@ func NewTrustStore(caCertPath, crlPath string) (*TrustStore, error) {
 	return ts, nil
 }
 
+// AddTrustedCert добавляет сертификат в список доверенных.
+//
+// Нужен именно добавление в память, а не только запись в peers/: иначе
+// проверка конфликта CN для второго сертификата с тем же именем не увидела бы
+// первый и позволила бы подмену до перезапуска процесса, а SSH к соседу не
+// заработал бы, пока узел не перезагрузится.
+func (ts *TrustStore) AddTrustedCert(cert *x509.Certificate) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	for _, existing := range ts.trustedCerts {
+		if existing == cert {
+			return
+		}
+		if existing.SerialNumber != nil && cert.SerialNumber != nil &&
+			existing.SerialNumber.Cmp(cert.SerialNumber) == 0 {
+			// Такой серийник уже есть — дубликат не нужен.
+			return
+		}
+	}
+
+	ts.trustedCerts = append(ts.trustedCerts, cert)
+}
+
+// CertByCN ищет доверенный сертификат по имени узла.
+func (ts *TrustStore) CertByCN(cn string) (*x509.Certificate, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	for _, cert := range ts.getTrustedCertsLocked() {
+		if cert != nil && cert.Subject.CommonName == cn {
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("сертификат для CN=%s не найден в TrustStore", cn)
+}
+
 // loadTrustedCertsFromDisk загружает доверенные сертификаты из поддиректорий.
-// Структура: <caDir>/../beacon-*/cert.pem
+//
+// Два источника:
+//   - beacon-*/cert.pem — своя выдача (узел со своими ключами);
+//   - peers/*.pem — сертификаты, полученные по mTLS от соседей.
+//
+// Оба источника равноправны: сертификат соседа так же подписан нашим CA, как
+// и свой, и он нужен всем проверкам — поиск клиента для SSH, host-ключ,
+// ключи подписи gossip.
 func (ts *TrustStore) loadTrustedCertsFromDisk(caCertPath string) {
 	// Определяем корневую директорию данных
 	// caCertPath = <dataDir>/ca/ca-cert.pem → dataDir = <dataDir>
@@ -97,7 +142,7 @@ func (ts *TrustStore) loadTrustedCertsFromDisk(caCertPath string) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "ca" {
+		if !entry.IsDir() || entry.Name() == "ca" || entry.Name() == peersDirName {
 			continue
 		}
 		certPath := filepath.Join(dataDir, entry.Name(), "cert.pem")
@@ -123,6 +168,27 @@ func (ts *TrustStore) loadTrustedCertsFromDisk(caCertPath string) {
 			log.Printf("[TrustStore] загружен доверенный сертификат: %s (CN=%s)",
 				certPath, cert.Subject.CommonName)
 		}
+	}
+
+	// Сертификаты, полученные от соседей.
+	for _, cert := range PeerCertificates(dataDir) {
+		opts := x509.VerifyOptions{
+			Roots:     ts.caPool,
+			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}
+		if _, err := cert.Verify(opts); err != nil {
+			log.Printf("[TrustStore] сертификат соседа CN=%s не прошёл проверку CA: %v",
+				cert.Subject.CommonName, err)
+			continue
+		}
+
+		if ts.crl != nil && ts.crl.IsRevoked(cert.SerialNumber) {
+			log.Printf("[TrustStore] сертификат соседа CN=%s отозван — пропущен",
+				cert.Subject.CommonName)
+			continue
+		}
+
+		ts.trustedCerts = append(ts.trustedCerts, cert)
 	}
 }
 

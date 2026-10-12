@@ -209,12 +209,25 @@ func (b *BeaconNode) loadTrustStore() error {
 // Start запускает все подсистемы маячка.
 func (b *BeaconNode) Start() error {
 	limiter := NewRateLimiter(b.config.RateLimitRate, b.config.RateLimitBurst)
+
+	// Discovery всегда слушает 0.0.0.0, а не адрес из -bind.
+	//
+	// Объявления приходят на broadcast-адрес подсети (192.168.1.255), и сокет,
+	// привязанный к одному адресу (192.168.1.166), такой пакет не получает —
+	// он доставляется только сокетам, слушающим все адреса. С -bind на
+	// конкретный адрес маячок не видел бы соседей вовсе. Адрес из -bind
+	// продолжает применяться к TCP-слушателям (TLS и SSH).
+	discoveryBind := "0.0.0.0"
+	if b.config.DiscoveryBindAddr != "" {
+		discoveryBind = b.config.DiscoveryBindAddr
+	}
+
 	b.discovery = NewDiscovery(
 		b.nodeID, b.edPriv,
 		b.config.DiscoveryPort,
 		"239.19.84.1",          // multicast (попытка №1)
 		b.config.BroadcastAddr, // broadcast (основной режим)
-		b.config.BindAddr,
+		discoveryBind,
 		limiter,
 	)
 	// Начинаем с broadcast — multicast не работает через WiFi-роутеры
@@ -276,6 +289,40 @@ func (b *BeaconNode) startSSHServer() {
 		b.config.SSHPort, len(allowed))
 }
 
+// StartStateWriter запускает периодическую запись state.json.
+//
+// Нужен отдельному процессу `beacon monitor`: у него нет доступа к памяти
+// маячка, а без адресов пиров он показывает только имена.
+func (b *BeaconNode) StartStateWriter() error {
+	if err := writeStateFile(b.config, b); err != nil {
+		return err
+	}
+
+	b.wg.Add(1)
+	go b.stateWriterLoop()
+
+	return nil
+}
+
+// stateWriterLoop пишет state.json раз в секунду.
+func (b *BeaconNode) stateWriterLoop() {
+	defer b.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.stopCh:
+			return
+		case <-ticker.C:
+			if err := writeStateFile(b.config, b); err != nil {
+				log.Printf("[Beacon] запись state.json: %v", err)
+			}
+		}
+	}
+}
+
 // Stop останавливает все подсистемы.
 func (b *BeaconNode) Stop() {
 	close(b.stopCh)
@@ -303,6 +350,14 @@ func (b *BeaconNode) onPeerDiscovered(senderID [16]byte, addr *net.UDPAddr, pktT
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Собственный NodeID не может быть пиром: это либо наше же broadcast-объявление,
+	// вернувшееся на сокет, либо попытка выдать себя за нас.
+	if senderID == b.nodeID {
+		log.Printf("[Beacon] объявление с собственным NodeID %X от %s проигнорировано",
+			senderID, addr)
+		return
+	}
+
 	peer, exists := b.peers[senderID]
 	if !exists {
 		log.Printf("[Beacon] обнаружен новый пир: ID=%X addr=%s type=%d",
@@ -317,7 +372,14 @@ func (b *BeaconNode) onPeerDiscovered(senderID [16]byte, addr *net.UDPAddr, pktT
 
 	peer.LastSeen = time.Now()
 
-	if pktType == PktEcho && !peer.Connected {
+	// Дозваниваемся в ответ на announce и на echo.
+	//
+	// Раньше звонок шёл только на echo, то есть инициатором всегда был тот,
+	// кто получил announce. Два узла, увидевшие друг друга одновременно по
+	// announce'ам, оставались без соединения: каждый ждал, что позвонит
+	// другой. Теперь dial делает тот, кто обнаружил пира, независимо от
+	// типа пакета.
+	if !peer.Connected {
 		go b.connectToPeer(peer)
 	}
 }
@@ -392,6 +454,13 @@ func (b *BeaconNode) connectToPeer(peer *DiscoveredPeer) {
 // инициировал соединение, наши отзывы так и не узнал бы, а узнать их мог бы
 // только ждать 30-минутного цикла.
 func (b *BeaconNode) pushGossip(conn *tls.Conn, reason string) {
+	// Сначала свой сертификат: без него получатель не сможет ни разрешить
+	// наше имя, ни проверить наши подписи gossip.
+	_, certPath, _ := b.config.BeaconPaths()
+	if err := ShareCertificate(certPath, conn, b.edPriv, b.nodeID); err != nil {
+		log.Printf("[Beacon] не удалось отправить сертификат (%s): %v", reason, err)
+	}
+
 	entries := b.trustStore.GetRevokedEntries()
 	if len(entries) == 0 {
 		return
@@ -464,8 +533,27 @@ func (b *BeaconNode) handlePeerMessage(data []byte, peer *DiscoveredPeer, fullPk
 	switch pkt.Type {
 	case PktGossip:
 		b.handleGossip(pkt, peer, fullPkt)
+	case PktCertShare:
+		b.handleCertShare(pkt, peer)
 	default:
 		log.Printf("[Beacon] неизвестный тип сообщения: %d", pkt.Type)
+	}
+}
+
+// handleCertShare принимает сертификат соседа.
+//
+// Получение сертификата не равно доверию: проверка идёт по CA и CRL, а
+// сохранение лишь добавляет CN в roster. Поэтому прежде чем принимать,
+// сверяем, что отправитель — действительно тот, кем представляется.
+func (b *BeaconNode) handleCertShare(pkt *DiscoveryPacket, peer *DiscoveredPeer) {
+	stored, err := AcceptCertificate(b.config.DataDir, b.trustStore, pkt)
+	if err != nil {
+		log.Printf("[Beacon] сертификат от %s не принят: %v", peer.Addr, err)
+		return
+	}
+
+	if stored {
+		log.Printf("[Beacon] получен сертификат от %s (CN добавлен в roster)", peer.Addr)
 	}
 }
 
@@ -654,6 +742,16 @@ func (b *BeaconNode) handleIncomingConnection(conn *tls.Conn, peerCert *x509.Cer
 	peerNodeID, err := NodeIDFromCert(peerCert)
 	if err != nil {
 		log.Printf("[Beacon] входящее соединение от %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	// Соединение с самим собой: мы дозвонились до собственного TLS-порта —
+	// так бывает, когда сосед с тем же адресом (например, клиент `beacon ssh`
+	// на этой же машине) объявился по discovery. Запись собственного сертификата
+	// в пиры дала бы в мониторе самого себя и лишнее соединение в карте.
+	if peerNodeID == b.nodeID {
+		log.Printf("[Beacon] входящее соединение с собственным сертификатом CN=%s — игнорируется",
+			peerCert.Subject.CommonName)
 		return
 	}
 

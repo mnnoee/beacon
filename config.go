@@ -54,6 +54,10 @@ const (
 	PktAnnounce uint8 = 0x01 // Маячок объявляет о себе
 	PktEcho     uint8 = 0x02 // Ответ на announce (подтверждение присутствия)
 	PktGossip   uint8 = 0x03 // Передача обновлений CRL
+	// PktCertShare передаёт свой сертификат соседу по уже установленному
+	// mTLS. Без него узлы не знают сертификатов друг друга и не могут ни
+	// разрешить имя в адрес, ни принять SSH, ни проверить подпись gossip.
+	PktCertShare uint8 = 0x04
 )
 
 // Config содержит все параметры конфигурации запуска.
@@ -79,11 +83,20 @@ type Config struct {
 	TrustStorePath string   // Путь к локальному Trust Store (список известных пиров)
 
 	// --- Сетевые параметры ---
-	DiscoveryPort int           // UDP-порт для обнаружения
-	TLSPort       int           // TCP-порт для TLS-соединений
-	BroadcastAddr string        // Адрес для UDP broadcast (например "255.255.255.255" или конкретная подсеть)
-	BindAddr      string        // Адрес привязки для TCP-слушателя
-	CertTTL       time.Duration // Время жизни выдаваемых сертификатов
+	DiscoveryPort int    // UDP-порт для обнаружения
+	TLSPort       int    // TCP-порт для TLS-соединений
+	BroadcastAddr string // Адрес для UDP broadcast (например "255.255.255.255" или конкретная подсеть)
+	BindAddr      string // Адрес привязки для TCP-слушателей (TLS, SSH)
+
+	// DiscoveryBindAddr — адрес привязки UDP-слушателя discovery.
+	//
+	// Отдельное поле не для удобства, а по необходимости: broadcast-пакет
+	// доставляется только сокетам, слушающим все адреса, поэтому значение
+	// BindAddr (например -bind 192.168.1.166) для discovery не годится.
+	// Пусто = слушать 0.0.0.0, что и требуется в обычном случае.
+	DiscoveryBindAddr string
+
+	CertTTL time.Duration // Время жизни выдаваемых сертификатов
 
 	// --- Параметры безопасности ---
 	RateLimitBurst  int     // Максимум пакетов в секунду от одного IP

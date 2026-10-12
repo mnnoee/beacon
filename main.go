@@ -105,6 +105,10 @@ func cmdSSH(args []string) {
 	dataDir := fs.String("dir", "./beacon-data", "директория с данными")
 	nodeName := fs.String("name", "", "имя этого маячка (для аутентификации)")
 	sshPort := fs.Int("p", 0, "порт SSH (переопределяет авто)")
+	// Порт discovery должен совпадать с тем, на котором слушают маячки:
+	// иначе broadcast-запрос уйдёт мимо, и имя не разрешится в адрес.
+	discPort := fs.Int("disc-port", DefaultDiscoveryPort, "UDP-порт discovery (как у маячков)")
+	broadcastAddr := fs.String("broadcast", "255.255.255.255", "broadcast-адрес сети")
 
 	fs.Parse(args)
 
@@ -119,8 +123,15 @@ func cmdSSH(args []string) {
 	cfg := DefaultConfig()
 	cfg.DataDir = *dataDir
 	cfg.NodeName = *nodeName
+	cfg.DiscoveryPort = *discPort
+	cfg.BroadcastAddr = *broadcastAddr
 	if *sshPort > 0 {
 		cfg.SSHPort = *sshPort
+	}
+
+	if cfg.NodeName == "" {
+		fmt.Fprintln(os.Stderr, "укажите имя этого маячка: beacon ssh -name <имя> <цель> [команда]")
+		os.Exit(1)
 	}
 
 	client := NewSSHClient(cfg)
@@ -148,6 +159,11 @@ func cmdMonitor(args []string) {
 	dataDir := fs.String("dir", "./beacon-data", "директория с данными")
 	nodeName := fs.String("name", "", "имя этого маячка (обязательно)")
 
+	// Порт, по которому пингуются соседи. Без этого флага монитор стучался бы
+	// в 1985, даже когда маячок запущен на другом порту, и показывал соседей
+	// офлайн при живом узле.
+	tlsPort := fs.Int("tls-port", DefaultTLSPort, "TCP-порт маячков для проверки доступности")
+
 	fs.Parse(args)
 
 	if *nodeName == "" {
@@ -158,6 +174,7 @@ func cmdMonitor(args []string) {
 	cfg := DefaultConfig()
 	cfg.DataDir = *dataDir
 	cfg.NodeName = *nodeName
+	cfg.TLSPort = *tlsPort
 
 	if err := RunMonitor(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "ошибка монитора: %v\n", err)
@@ -180,6 +197,7 @@ func cmdCA(args []string) {
 	caCertPath := fs.String("ca-cert", "", "путь к сертификату CA (авто)")
 	reissue := fs.Bool("reissue", false, "пере-выдача для существующего узла (потерян ключ)")
 	serialArg := fs.String("serial", "", "серийный номер сертификата (для revoke-beacon)")
+	nodeName := fs.String("node", "", "имя узла (для revoke-beacon)")
 	role := fs.String("role", "peer", "роль сертификата: peer (участие в сети) или server (плюс SSH)")
 
 	fs.Parse(args[1:])
@@ -205,9 +223,13 @@ func cmdCA(args []string) {
 		cmdProvisionBeacon(*dataDir, *caKeyPath, *caCertPath, nodeName, *reissue, *role)
 
 	case "revoke-beacon":
-		if fs.NArg() < 1 && *serialArg == "" {
-			fmt.Fprintln(os.Stderr, "укажите серийный номер: beacon ca revoke-beacon -serial <номер>")
+		if fs.NArg() < 1 && *serialArg == "" && *nodeName == "" {
+			fmt.Fprintln(os.Stderr, "укажите, что отзывать: -serial <номер> или -node <CN>")
 			os.Exit(1)
+		}
+		if *nodeName != "" {
+			cmdRevokeBeaconByNode(*dataDir, *nodeName)
+			return
 		}
 		// Приоритет у флага: значение копипастом из list-trusted.
 		// Позиционный аргумент оставлен для обратной совместимости.
@@ -417,6 +439,37 @@ func cmdProvisionBeacon(dataDir, caKeyPath, caCertPath, nodeName string, reissue
 	fmt.Printf("  beacon beacon -name %s\n", nodeName)
 }
 
+// cmdRevokeBeaconByNode отзывает сертификат по имени узла.
+//
+// Удобнее, чем вводить серийник руками: имя берётся из индекса CA, а
+// соответствующий сертификат ищется на диске (включая архив пере-выданных).
+func cmdRevokeBeaconByNode(dataDir, cn string) {
+	normalized, err := normalizeNodeName(cn)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	idx, err := LoadCAIndex(dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "чтение индекса CA: %v\n", err)
+		os.Exit(1)
+	}
+
+	entry, ok := idx.Lookup(normalized)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "узел %s не найден в индексе CA\n", normalized)
+		fmt.Fprintln(os.Stderr, "доступные узлы:")
+		for _, name := range idx.Names() {
+			fmt.Fprintf(os.Stderr, "  - %s\n", name)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("Отзыв узла %s\n", normalized)
+	cmdRevokeBeacon(dataDir, entry.Serial)
+}
+
 // cmdRevokeBeacon отзывает сертификат маячка.
 //
 // Принимает серийный номер сертификата — десятичную строку из
@@ -570,41 +623,103 @@ func cmdImportCA(dataDir, caCertPath string) {
 	fmt.Printf("CA-сертификат импортирован в %s/ca/ca-cert.pem\n", dataDir)
 }
 
-// cmdExportCA экспортирует CA-файлы для копирования на другую машину.
+// cmdExportCA объясняет, что и зачем копировать на вторую CA-машину.
+//
+// Раньше команда предлагала скопировать ca-key.pem вместе с сертификатом и
+// CRL. Это антипаттерн: две машины с одним приватным ключом CA означают, что
+// компрометация любой из них компрометирует всю PKI. Для работы «двумя CA»
+// достаточно копировать публичные файлы, а второй CA должен выпускать
+// сертификаты СВОИМ ключом и получать доверие через import-ca.
 func cmdExportCA(dataDir string) {
 	fmt.Println("=== CA Export ===")
 	fmt.Printf("Директория: %s/ca/\n", dataDir)
 	fmt.Println()
-	fmt.Println("Файлы для копирования на другую CA-машину:")
-	fmt.Println("  1. ca-key.pem     — приватный ключ CA (СЕКРЕТНО!)")
-	fmt.Println("  2. ca-cert.pem    — сертификат CA (публичный)")
-	fmt.Println("  3. crl.pem        — список отозванных сертификатов")
+	fmt.Println("ПУБЛИЧНЫЕ файлы (их и копируйте):")
+	fmt.Println("  1. ca-cert.pem    — сертификат CA")
+	fmt.Println("  2. crl.pem        — список отозванных сертификатов")
 	fmt.Println()
-	fmt.Println("Пример копирования:")
-	fmt.Printf("  scp %s/ca/*.pem user@remote-host:~/beacon-data/ca/\n", dataDir)
+	fmt.Println("СЕКРЕТНО и НЕ ПОДЛЕЖИТ копированию:")
+	fmt.Println("  ca-key.pem        — приватный ключ CA")
 	fmt.Println()
-	fmt.Println("После копирования на удалённой машине запустите:")
-	fmt.Println("  beacon ca list-trusted — проверьте что CA загружен")
+	fmt.Println("Раздача приватного ключа между машинами означает, что")
+	fmt.Println("компрометация любой из них компрометирует всю сеть.")
+	fmt.Println()
+	fmt.Println("Если на второй машине должен работать полноценный CA, он")
+	fmt.Println("генерирует СВОЙ ключ, а все маячки импортируют оба сертификата:")
+	fmt.Printf("  beacon ca import-ca -dir %s /путь/до/ca-cert.pem\n", dataDir)
+	fmt.Println()
+	fmt.Println("Если вторая машина нужна только для чтения CRL:")
+	fmt.Printf("  beacon ca list-trusted -dir %s\n", dataDir)
 }
 
 // cmdSyncCRL синхронизирует CRL с другой CA-машиной через scp.
+//
+// Источник строго валидируется: раньше строка подставлялась в sh -c, то есть
+// `beacon ca sync-crl 'x; rm -rf /'` выполнял обычную инъекцию. scp теперь
+// запускается без оболочки, а формат ограничен user@host:/path.
 func cmdSyncCRL(dataDir, source string) {
-	// source формат: user@host:/path/to/crl.pem
-	fmt.Printf("Синхронизация CRL с %s...\n", source)
-
-	crlPath := dataDir + "/ca/crl.pem"
-
-	// Пытаемся скопировать CRL через scp
-	cmd := fmt.Sprintf("scp %s %s", source, crlPath)
-	fmt.Printf("Выполняю: %s\n", cmd)
-
-	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	user, host, path, err := parseSCPSource(source)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ошибка scp: %v\n%s", err, string(out))
+		fmt.Fprintf(os.Stderr, "некорректный источник: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("CRL успешно синхронизирован")
+	crlPath := dataDir + "/ca/crl.pem"
+
+	// Без sh -c: аргументы передаются напрямую, поэтому спецсимволы
+	// в пути или имени хоста не выполняются.
+	cmd := exec.Command("scp", user+"@"+host+":"+path, crlPath)
+	cmd.Stderr = os.Stderr
+
+	fmt.Printf("Синхронизация CRL с %s@%s:%s\n", user, host, path)
+
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scp завершился ошибкой: %v\n%s", err, out)
+		os.Exit(1)
+	}
+
+	fmt.Println("CRL синхронизирован. Проверьте список отозванных:")
+	fmt.Printf("  beacon ca list-trusted -dir %s\n", dataDir)
+}
+
+// parseSCPSource разбирает источник вида user@host:/path.
+//
+// Разделитель ":" встречается ровно один раз: иначе user@host:2222:path
+// разобрался бы как кривой путь и молча ушёл бы в scp другой командой.
+func parseSCPSource(source string) (user, host, path string, err error) {
+	source = strings.TrimSpace(source)
+
+	if source == "" {
+		return "", "", "", fmt.Errorf("источник не задан (ожидается user@host:/path/to/crl.pem)")
+	}
+
+	if strings.ContainsAny(source, " \t\n;|&$`<>") {
+		return "", "", "", fmt.Errorf("источник содержит недопустимые символы: %q", source)
+	}
+
+	// Разделяем на [user@host] и [path]
+	colon := strings.LastIndex(source, ":")
+	if colon <= 0 || colon == len(source)-1 {
+		return "", "", "", fmt.Errorf("ожидается формат user@host:/путь/до/crl.pem, получено %q", source)
+	}
+
+	remote := source[:colon]
+	path = source[colon+1:]
+
+	at := strings.Index(remote, "@")
+	if at <= 0 || at == len(remote)-1 {
+		return "", "", "", fmt.Errorf("ожидается формат user@host:/путь/до/crl.pem, получено %q", source)
+	}
+
+	user = remote[:at]
+	host = remote[at+1:]
+
+	if user == "" || host == "" || path == "" {
+		return "", "", "", fmt.Errorf("пустой user, host или path в %q", source)
+	}
+
+	return user, host, path, nil
 }
 
 // cmdBeacon запускает Маячок.
@@ -630,6 +745,7 @@ func cmdBeacon(args []string) {
 	// пользователю, от имени которого запущен (часто root), любому узлу
 	// с валидным сертификатом — поэтому это выбор владельца, а не дефолт.
 	sshEnabled := fs.Bool("ssh", false, "включить SSH-сервер на этом узле")
+	tuiEnabled := fs.Bool("tui", false, "показать TUI-монитор в этом же процессе")
 	sshAllow := fs.String("ssh-allow", "", "CN, которым разрешён вход (через запятую)")
 	sshAllowCommands := fs.String("ssh-allow-commands", "", "разрешённые exec-команды (через запятую)")
 	sshShell := fs.String("ssh-shell", cfg.SSHShell, "интерпретатор для SSH-сессий")
@@ -672,12 +788,52 @@ func cmdBeacon(args []string) {
 		log.Fatalf("[Main] ошибка запуска: %v", err)
 	}
 
+	// state.json нужен отдельному процессу `beacon monitor`, поэтому он пишется
+	// всегда, а не только в режиме -tui. Файл маленький, обновляется раз в
+	// секунду и содержит только имена и адреса пиров.
+	if err := node.StartStateWriter(); err != nil {
+		log.Printf("[Main] запись состояния не запущена: %v", err)
+	}
+
+	// TUI в этом же процессе видит реальных пиров из node.peers: намного
+	// честнее, чем отдельный монитор, вынужденный гадать по сертификатам.
+	if *tuiEnabled {
+		runTUI(node)
+		return
+	}
+
 	// Ждём сигнала завершения
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	sig := <-sigCh
 	log.Printf("[Main] получен сигнал %v, завершение...", sig)
+
+	node.Stop()
+	log.Println("[Main] маячок остановлен")
+}
+
+// runTUI поднимает монитор поверх уже запущенного маячка.
+//
+// Пиры берутся прямо из памяти маячка, а не из state.json: тот же процесс и так
+// знает адреса, и файл обновлялся бы с задержкой в секунду. state.json при
+// этом всё равно пишется (см. cmdBeacon) — по нему работает отдельный процесс
+// `beacon monitor`.
+func runTUI(node *BeaconNode) {
+	// Монитор запускается в этом же процессе, но в своей горутине: TUI
+	// занимает терминал, и без этого сигналы завершения не доедут.
+	go func() {
+		if err := runMonitor(node.config, livePeerLister(node.config, node)); err != nil {
+			log.Printf("[Main] монитор завершился с ошибкой: %v", err)
+		}
+	}()
+
+	// Держим процесс живым, пока монитор не закроется.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// TUI выходит по 'q' сам; здесь ловим системные сигналы.
+	<-sigCh
 
 	node.Stop()
 	log.Println("[Main] маячок остановлен")
