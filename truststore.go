@@ -313,7 +313,7 @@ func (ts *TrustStore) MergeGossipCRL(senderNumber uint64, entries []revokedCert)
 	return true
 }
 
-// VerifyPeerCert —обработчик для tls.Config.VerifyPeerCertificate.
+// VerifyPeerCert — обработчик tls.Config.VerifyPeerCertificate.
 // Проверяет, что сертификат пира подписан нашим CA и не отозван.
 func (ts *TrustStore) VerifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if len(rawCerts) == 0 {

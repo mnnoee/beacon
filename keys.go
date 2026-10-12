@@ -8,11 +8,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 )
 
 // DeriveKeyPBKDF2 выводит ключ из пароля методом PBKDF2-HMAC-SHA256.
@@ -140,30 +137,6 @@ const (
 	privateKeyPEMType   = "PRIVATE KEY"
 )
 
-// SerializePublicKeyPEM кодирует публичный ключ в PEM-формат.
-func SerializePublicKeyPEM(pub ed25519.PublicKey) []byte {
-	der, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		return nil
-	}
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  "PUBLIC KEY",
-		Bytes: der,
-	})
-}
-
-// SerializePrivateKeyPEM кодирует приватный ключ в PEM-формат.
-func SerializePrivateKeyPEM(priv ed25519.PrivateKey) ([]byte, error) {
-	der, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("сериализация приватного ключа: %w", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: der,
-	}), nil
-}
-
 // parseEd25519PrivateKey разбирает DER Ed25519-приватного ключа.
 func parseEd25519PrivateKey(der []byte) (ed25519.PrivateKey, error) {
 	key, err := x509.ParsePKCS8PrivateKey(der)
@@ -177,59 +150,4 @@ func parseEd25519PrivateKey(der []byte) (ed25519.PrivateKey, error) {
 	}
 
 	return edKey, nil
-}
-
-// DeserializePrivateKeyPEM раскодирует приватный ключ из PEM.
-func DeserializePrivateKeyPEM(data []byte) (ed25519.PrivateKey, error) {
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM-блок приватного ключа")
-	}
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("парсинг приватного ключа: %w", err)
-	}
-	edKey, ok := key.(ed25519.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("ключ не является Ed25519 (тип %T)", key)
-	}
-	return edKey, nil
-}
-
-// DeserializePublicKeyPEM раскодирует публичный ключ из PEM.
-func DeserializePublicKeyPEM(data []byte) (ed25519.PublicKey, error) {
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM-блок публичного ключа")
-	}
-	key, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("парсинг публичного ключа: %w", err)
-	}
-	edKey, ok := key.(ed25519.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("ключ не является Ed25519 (тип %T)", key)
-	}
-	return ed25519.PublicKey(edKey), nil
-}
-
-// SaveKeyToFile сохраняет PEM-кодированный ключ на диск с ограничением прав доступа.
-func SaveKeyToFile(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("создание директории %s: %w", dir, err)
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-// ReadFileContents читает весь файл. Если файл не существует, возвращает nil без ошибки.
-func ReadFileContents(path string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return data, nil
 }

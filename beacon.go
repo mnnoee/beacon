@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -232,13 +233,10 @@ func (b *BeaconNode) Start() error {
 	b.discovery = NewDiscovery(
 		b.nodeID, b.edPriv,
 		b.config.DiscoveryPort,
-		"239.19.84.1",          // multicast (попытка №1)
-		b.config.BroadcastAddr, // broadcast (основной режим)
+		b.config.BroadcastAddr, // единственный режим: broadcast
 		discoveryBind,
 		limiter,
 	)
-	// Начинаем с broadcast — multicast не работает через WiFi-роутеры
-	b.discovery.useMulticast = false
 
 	// Discovery проверяет сертификаты объявившихся узлов: без TrustStore
 	// подпись пакета проверяется только на согласованность с NodeID, что не
@@ -925,5 +923,11 @@ func ImportCACert(dataDir, caCertPath string) error {
 		return fmt.Errorf("парсинг CA-сертификата: %w", err)
 	}
 
-	return SaveKeyToFile(dataDir+"/ca/ca-cert.pem", data)
+	// Каталог ca/ — 0700: сертификат публичный, но лежит он рядом с ключом.
+	caDir := filepath.Join(dataDir, "ca")
+	if err := os.MkdirAll(caDir, 0700); err != nil {
+		return fmt.Errorf("создание каталога %s: %w", caDir, err)
+	}
+
+	return os.WriteFile(filepath.Join(caDir, "ca-cert.pem"), data, 0644)
 }

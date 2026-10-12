@@ -602,45 +602,6 @@ func loadHostCert(path string) (*x509.Certificate, error) {
 	return x509.ParseCertificate(block.Bytes)
 }
 
-// isSSHCertificate проверяет, является ли ключ SSH-сертификатом.
-func isSSHCertificate(pubKey ssh.PublicKey) bool {
-	_, ok := pubKey.(*ssh.Certificate)
-	return ok
-}
-
-// extractX509FromSSHCert извлекает x509-сертификат из SSH-сертификата.
-// SSH-сертификаты (RFC 6187) содержат x509-сертификат в поле Key.
-func extractX509FromSSHCert(pubKey ssh.PublicKey) (*x509.Certificate, error) {
-	cert, ok := pubKey.(*ssh.Certificate)
-	if !ok {
-		return nil, fmt.Errorf("ключ не является SSH-сертификатом")
-	}
-
-	// Извлекаем raw bytes ключа из SSH-сертификата
-	keyBytes := cert.Key.Marshal()
-	if len(keyBytes) == 0 {
-		return nil, fmt.Errorf("SSH-сертификат не содержит ключа")
-	}
-
-	// Пробуем распарсить как ASN.1 DER x509-сертификат
-	parsedCert, err := x509.ParseCertificate(keyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("парсинг x509 из SSH cert: %w", err)
-	}
-
-	return parsedCert, nil
-}
-
-// isSSHCertSignedByCA проверяет подпись SSH-сертификата через x509.
-func isSSHCertSignedByCA(cert *x509.Certificate, caPool *x509.CertPool) bool {
-	opts := x509.VerifyOptions{
-		Roots:     caPool,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-	}
-	_, err := cert.Verify(opts)
-	return err == nil
-}
-
 // ptyRequestPayload — формат PTY-запроса SSH.
 type ptyRequestPayload struct {
 	Term   string

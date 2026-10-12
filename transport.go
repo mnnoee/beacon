@@ -163,19 +163,6 @@ func LoadECDSAKey(path string) (*ecdsa.PrivateKey, error) {
 	return key, nil
 }
 
-// LoadECDSACert загружает сертификат из PEM.
-func LoadECDSACert(path string) (*x509.Certificate, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("не удалось декодировать PEM")
-	}
-	return x509.ParseCertificate(block.Bytes)
-}
-
 // GenerateToken генератор криптографически стойкого токена.
 func GenerateToken(length int) ([]byte, error) {
 	token := make([]byte, length)

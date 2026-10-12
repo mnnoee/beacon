@@ -5,12 +5,23 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
-	"net"
 	"time"
 )
 
-// Максимальный размер payload в discovery-пакете
+// MaxPayloadSize ограничивает размер payload в discovery-пакете
 const MaxPayloadSize = 512
+
+// PacketTimeWindow — допустимое расхождение времени в пакете.
+//
+// Окно симметричное: пакет принимается, если его timestamp отличается от
+// нашего не больше чем на это значение в любую сторону. Прежняя проверка была
+// асимметричной (старше 300 секунд — отбросить, из будущего — не больше 60) и
+// существовала в двух местах с одинаковыми числами: разъезд окон означал бы,
+// что один и тот же пакет в одном месте принимался, а в другом отбрасывался.
+//
+// Пять минут — с запасом на дешёвые роутеры, у которых часы могут враться на
+// минуты. От replay это не защищает: за это отвечает кэш nonce с TTL 300 с.
+const PacketTimeWindow = 5 * time.Minute
 
 // DiscoveryPacket — формат UDP-пакета обнаружения.
 //
@@ -144,11 +155,11 @@ func DeserializePacket(data []byte) (*DiscoveryPacket, error) {
 		return nil, fmt.Errorf("payloadLen (%d) превышает доступные данные", payloadLen)
 	}
 
-	// Проверяем timestamp: пакеты старше 5 минут отбрасываются
-	// Это защищает от replay-атак без необходимости хранить состояние
-	now := time.Now().Unix()
-	if now-timestamp > 300 || timestamp-now > 60 {
-		return nil, fmt.Errorf("timestamp пакета вне допустимого диапазона (разница %d сек)", now-timestamp)
+	// Время пакета отвечает только за синхронизацию часов: replay гарантируется
+	// nonce'ом с TTL 300 с (см. NonceTTL).
+	if diff := time.Since(time.Unix(timestamp, 0)); diff > PacketTimeWindow || diff < -PacketTimeWindow {
+		return nil, fmt.Errorf("timestamp пакета вне окна ±%v (расхождение %v)",
+			PacketTimeWindow, diff.Truncate(time.Second))
 	}
 
 	payload := make([]byte, payloadLen)
@@ -163,12 +174,6 @@ func DeserializePacket(data []byte) (*DiscoveryPacket, error) {
 		Nonce:     nonce,
 		Payload:   payload,
 	}, nil
-}
-
-// DataToSign возвращает байты, которые должны быть подписаны/проверены.
-// Это всё до области подписи.
-func (p *DiscoveryPacket) DataToSign() []byte {
-	return p.Serialize()
 }
 
 // GossipPayload — полезная нагрузка для PktGossip-пакетов.
@@ -275,22 +280,4 @@ func DeserializeGossipPayload(data []byte) (*GossipPayload, error) {
 		Number:         number,
 		RevokedEntries: entries,
 	}, nil
-}
-
-// IsBroadcastAddr проверяет, является ли адрес broadcast-адресом.
-func IsBroadcastAddr(addr *net.UDPAddr) bool {
-	ip := addr.IP.To4()
-	if ip == nil {
-		ip = addr.IP.To16()
-	}
-	if ip == nil {
-		return false
-	}
-	// Все байты 0xFF — классический broadcast
-	for _, b := range ip {
-		if b != 0xFF {
-			return false
-		}
-	}
-	return true
 }

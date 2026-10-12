@@ -82,13 +82,9 @@ func TestEd25519InCertificateSAN(t *testing.T) {
 	}
 
 	// Приватный ключ должен соответствовать публичному в сертификате.
-	privData, err := os.ReadFile(issued.Ed25519Path)
+	priv, err := loadEd25519Key(issued.Ed25519Path)
 	if err != nil {
 		t.Fatalf("чтение Ed25519-ключа: %v", err)
-	}
-	priv, err := DeserializePrivateKeyPEM(privData)
-	if err != nil {
-		t.Fatalf("DeserializePrivateKeyPEM: %v", err)
 	}
 	if !priv.Public().(ed25519.PublicKey).Equal(got) {
 		t.Fatal("приватный ключ не соответствует ключу в сертификате")
@@ -201,11 +197,7 @@ func TestDiscoverySignatureRejectsSpoofing(t *testing.T) {
 // mustLoadEdKey загружает Ed25519-ключ или падает в тесте.
 func mustLoadEdKey(t *testing.T, path string) ed25519.PrivateKey {
 	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("чтение ключа: %v", err)
-	}
-	key, err := DeserializePrivateKeyPEM(data)
+	key, err := loadEd25519Key(path)
 	if err != nil {
 		t.Fatalf("разбор ключа: %v", err)
 	}

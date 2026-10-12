@@ -63,9 +63,6 @@ const (
 // Config содержит все параметры конфигурации запуска.
 // Заполняется из флагов CLI или значений по умолчанию.
 type Config struct {
-	// Режим работы: "ca" — Главная Нода, "beacon" — Маячок
-	Mode string
-
 	// Путь к директории с данными (ключи, сертификаты, конфиг)
 	DataDir string
 
@@ -75,12 +72,11 @@ type Config struct {
 	CRLPath    string // Путь к списку отозванных сертификатов
 
 	// --- Параметры Маячка ---
-	NodeName       string   // Уникальное имя этого маячка (используется как CN в сертификате)
-	NodeID         [16]byte // Уникальный идентификатор узла (UUID-like)
-	TLSKeyPath     string   // Путь к приватному ключу маячка
-	TLSCertPath    string   // Путь к сертификату маячка
-	TrustedCAPath  string   // Путь к корневому сертификату CA для проверки пиров
-	TrustStorePath string   // Путь к локальному Trust Store (список известных пиров)
+	NodeName      string // Уникальное имя этого маячка (используется как CN в сертификате)
+	NodeID        [16]byte
+	TLSKeyPath    string // Путь к приватному ключу маячка
+	TLSCertPath   string // Путь к сертификату маячка
+	TrustedCAPath string // Путь к корневому сертификату CA для проверки пиров
 
 	// --- Сетевые параметры ---
 	DiscoveryPort int    // UDP-порт для обнаружения
@@ -96,12 +92,9 @@ type Config struct {
 	// Пусто = слушать 0.0.0.0, что и требуется в обычном случае.
 	DiscoveryBindAddr string
 
-	CertTTL time.Duration // Время жизни выдаваемых сертификатов
-
 	// --- Параметры безопасности ---
-	RateLimitBurst  int     // Максимум пакетов в секунду от одного IP
-	RateLimitRate   float64 // Средняя скорость (пакетов/сек)
-	MaxConnsPerPeer int     // Максимум одновременных TLS-соединений с одним пиром
+	RateLimitBurst int     // Максимум пакетов в секунду от одного IP
+	RateLimitRate  float64 // Средняя скорость (пакетов/сек)
 
 	// --- Параметры SSH-сервера ---
 	// SSH выключен по умолчанию: включение открывает shell пользователю,
@@ -115,27 +108,21 @@ type Config struct {
 	SSHAllowCNs      []string      // Разрешённые CN (пустой список при -ssh = отказ всем)
 	SSHAllowCommands []string      // Разрешённые exec-команды (пустой = любой exec)
 	SSHInteractive   bool          // Разрешить интерактивный shell
-
-	// --- Provisioning ---
-	ProvisionToken string // Токен для offline-provisioning нового маячка
-	ProvisionName  string // Имя нового маячка для выдачи сертификата
 }
 
 // DefaultConfig возвращает конфигурацию с параметрами по умолчанию.
 func DefaultConfig() *Config {
 	return &Config{
-		DataDir:         "./beacon-data",
-		DiscoveryPort:   DefaultDiscoveryPort,
-		TLSPort:         DefaultTLSPort,
-		BroadcastAddr:   "255.255.255.255",
-		BindAddr:        "0.0.0.0",
-		CertTTL:         DefaultCertTTL,
-		RateLimitBurst:  10,
-		RateLimitRate:   2.0,
-		MaxConnsPerPeer: 5,
-		SSHPort:         2222,
-		SSHMaxConns:     10,
-		SSHIdleTimeout:  10 * time.Minute,
+		DataDir:        "./beacon-data",
+		DiscoveryPort:  DefaultDiscoveryPort,
+		TLSPort:        DefaultTLSPort,
+		BroadcastAddr:  "255.255.255.255",
+		BindAddr:       "0.0.0.0",
+		RateLimitBurst: 10,
+		RateLimitRate:  2.0,
+		SSHPort:        2222,
+		SSHMaxConns:    10,
+		SSHIdleTimeout: 10 * time.Minute,
 		// Shell по умолчанию — /bin/sh: bash не обязан существовать
 		// (например на mipsle-роутерах под OpenWrt).
 		SSHShell: "/bin/sh",

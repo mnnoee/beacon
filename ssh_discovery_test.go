@@ -137,7 +137,7 @@ func (f *discoveryFixture) startNeighbour(t *testing.T) *Discovery {
 		t.Fatalf("Ed25519-ключ соседа: %v", err)
 	}
 
-	disc := NewDiscovery(f.remoteCert.NodeID, remoteED, f.cfg.DiscoveryPort, "239.19.84.1",
+	disc := NewDiscovery(f.remoteCert.NodeID, remoteED, f.cfg.DiscoveryPort,
 		f.cfg.BroadcastAddr, "0.0.0.0", NewRateLimiter(1000, 100))
 	disc.SetTrustStore(remoteTS)
 	if err := disc.Start(); err != nil {
