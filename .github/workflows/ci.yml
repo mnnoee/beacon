@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: vet + тесты (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "не отформатировано:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: тесты с -race
+        run: go test -race -timeout 600s ./...
+
+      - name: покрытие
+        run: go test -cover -timeout 600s ./...
+
+  build:
+    name: сборка ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # mipsle — роутеры (OpenWrt и подобные), основная цель проекта;
+          # arm64 — Raspberry Pi и прочие SBC.
+          - arch: amd64
+          - arch: arm64
+          - arch: mipsle
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: сборка
+        run: GOOS=linux GOARCH=${{ matrix.arch }} go build -trimpath -ldflags='-s -w' -o beacon-${{ matrix.arch }} .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-${{ matrix.arch }}
+          path: beacon-${{ matrix.arch }}
