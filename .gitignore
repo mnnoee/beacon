@@ -10,3 +10,6 @@ beacon-data/
 coverage.out
 *.test
 /dist/
+
+# Рабочие заметки для себя — не публикуются
+docs/HANDOFF.md

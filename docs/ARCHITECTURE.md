@@ -191,8 +191,7 @@ beacon/
 │   ├── SECURITY.md    границы применимости и риски
 │   ├── LICENSE        MIT
 │   ├── USAGE.md       команды и флаги
-│   ├── ROADMAP.md     план работ и статус фаз
-│   └── HANDOFF.md     состояние проекта на паузе
+│   └── ROADMAP.md     план работ и статус фаз
 └── .github/workflows/ci.yml
 ```
 
